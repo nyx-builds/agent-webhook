@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 
 from agent_webhook.models import (
+    DeliveryAttempt,
     DeliveryStatus,
+    EventLogEntry,
+    EventSubscription,
     Header,
     RelayRule,
     WebhookDelivery,
@@ -79,6 +82,12 @@ class TestEndpointCRUD:
         assert updated is not None
         assert updated.name == "Updated Name"
 
+    def test_update_sets_updated_at(self, store, sample_endpoint):
+        store.add_endpoint(sample_endpoint)
+        original = sample_endpoint.updated_at
+        updated = store.update_endpoint(sample_endpoint.id, name="Updated")
+        assert updated.updated_at >= original
+
     def test_update_nonexistent(self, store):
         result = store.update_endpoint("nonexistent", name="X")
         assert result is None
@@ -134,6 +143,14 @@ class TestDeliveryCRUD:
         result = store.list_deliveries(event_type="payment")
         assert len(result) == 1
         assert result[0].event_type == "payment"
+
+    def test_list_with_limit(self, store, sample_endpoint):
+        store.add_endpoint(sample_endpoint)
+        for i in range(10):
+            d = WebhookDelivery(endpoint_id=sample_endpoint.id, payload={"i": i})
+            store.add_delivery(d)
+        result = store.list_deliveries(limit=5)
+        assert len(result) == 5
 
     def test_update_delivery(self, store, sample_endpoint):
         store.add_endpoint(sample_endpoint)
@@ -191,6 +208,99 @@ class TestRelayRules:
         assert store.delete_relay_rule(rule.id) is True
         assert store.get_relay_rule(rule.id) is None
 
+    def test_delete_nonexistent_rule(self, store):
+        assert store.delete_relay_rule("nonexistent") is False
+
+
+class TestEventSubscriptions:
+    def test_add_and_get(self, store):
+        sub = EventSubscription(endpoint_id="ep-1", event_types=["order.created"])
+        store.add_subscription(sub)
+        result = store.get_subscription(sub.id)
+        assert result is not None
+        assert result.endpoint_id == "ep-1"
+        assert "order.created" in result.event_types
+
+    def test_list_subscriptions(self, store):
+        s1 = EventSubscription(endpoint_id="ep-1", event_types=["a"])
+        s2 = EventSubscription(endpoint_id="ep-2", event_types=["b"])
+        store.add_subscription(s1)
+        store.add_subscription(s2)
+        subs = store.list_subscriptions()
+        assert len(subs) == 2
+
+    def test_list_by_endpoint(self, store):
+        s1 = EventSubscription(endpoint_id="ep-1", event_types=["a"])
+        s2 = EventSubscription(endpoint_id="ep-2", event_types=["b"])
+        store.add_subscription(s1)
+        store.add_subscription(s2)
+        subs = store.list_subscriptions(endpoint_id="ep-1")
+        assert len(subs) == 1
+        assert subs[0].endpoint_id == "ep-1"
+
+    def test_delete_subscription(self, store):
+        sub = EventSubscription(endpoint_id="ep-1", event_types=["a"])
+        store.add_subscription(sub)
+        assert store.delete_subscription(sub.id) is True
+        assert store.get_subscription(sub.id) is None
+
+    def test_delete_nonexistent_subscription(self, store):
+        assert store.delete_subscription("nonexistent") is False
+
+
+class TestEventLog:
+    def test_add_and_list(self, store):
+        entry = EventLogEntry(
+            event_type="endpoint.created",
+            details={"name": "Test"},
+            endpoint_id="ep-1",
+        )
+        store.add_event_log(entry)
+        entries = store.list_event_log()
+        assert len(entries) == 1
+        assert entries[0].event_type == "endpoint.created"
+
+    def test_list_by_event_type(self, store):
+        e1 = EventLogEntry(event_type="endpoint.created")
+        e2 = EventLogEntry(event_type="delivery.success")
+        store.add_event_log(e1)
+        store.add_event_log(e2)
+        result = store.list_event_log(event_type="endpoint.created")
+        assert len(result) == 1
+
+    def test_list_by_endpoint_id(self, store):
+        e1 = EventLogEntry(event_type="test", endpoint_id="ep-1")
+        e2 = EventLogEntry(event_type="test", endpoint_id="ep-2")
+        store.add_event_log(e1)
+        store.add_event_log(e2)
+        result = store.list_event_log(endpoint_id="ep-1")
+        assert len(result) == 1
+
+    def test_list_with_limit(self, store):
+        for i in range(10):
+            entry = EventLogEntry(event_type=f"event.{i}")
+            store.add_event_log(entry)
+        result = store.list_event_log(limit=5)
+        assert len(result) == 5
+
+    def test_event_log_sorted_newest_first(self, store):
+        e1 = EventLogEntry(event_type="first")
+        store.add_event_log(e1)
+        e2 = EventLogEntry(event_type="second")
+        store.add_event_log(e2)
+        entries = store.list_event_log()
+        assert entries[0].event_type == "second"
+        assert entries[1].event_type == "first"
+
+    def test_event_log_max_1000_entries(self, store):
+        """Event log should be trimmed to 1000 entries."""
+        for i in range(1010):
+            entry = EventLogEntry(event_type=f"event.{i}")
+            store.add_event_log(entry)
+        # After trimming, should have 1000
+        entries = store.list_event_log(limit=2000)
+        assert len(entries) == 1000
+
 
 class TestStats:
     def test_stats_empty(self, store, sample_endpoint):
@@ -223,6 +333,15 @@ class TestStats:
         assert stats["pending"] == 1
         assert stats["avg_duration_ms"] == 150.0
 
+    def test_stats_nonexistent_endpoint(self, store):
+        assert store.get_stats("nonexistent") is None
+
+    def test_get_all_stats(self, store, sample_endpoint, sample_endpoint2):
+        store.add_endpoint(sample_endpoint)
+        store.add_endpoint(sample_endpoint2)
+        stats = store.get_all_stats()
+        assert len(stats) == 2
+
 
 class TestPersistence:
     def test_data_survives_reload(self, tmp_path):
@@ -236,6 +355,28 @@ class TestPersistence:
         result = store2.get_endpoint(ep.id)
         assert result is not None
         assert result.name == "Persistent"
+
+    def test_subscriptions_survive_reload(self, tmp_path):
+        store_path = tmp_path / "persist_subs.json"
+        store = WebhookStore(store_path)
+        sub = EventSubscription(endpoint_id="ep-1", event_types=["test.event"])
+        store.add_subscription(sub)
+
+        store2 = WebhookStore(store_path)
+        result = store2.get_subscription(sub.id)
+        assert result is not None
+        assert "test.event" in result.event_types
+
+    def test_event_log_survives_reload(self, tmp_path):
+        store_path = tmp_path / "persist_log.json"
+        store = WebhookStore(store_path)
+        entry = EventLogEntry(event_type="test.persist", details={"key": "value"})
+        store.add_event_log(entry)
+
+        store2 = WebhookStore(store_path)
+        entries = store2.list_event_log()
+        assert len(entries) == 1
+        assert entries[0].event_type == "test.persist"
 
     def test_pending_deliveries(self, store, sample_endpoint):
         store.add_endpoint(sample_endpoint)

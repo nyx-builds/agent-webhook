@@ -9,6 +9,8 @@ from agent_webhook.engine import DeliveryEngine
 from agent_webhook.models import (
     DeliveryAttempt,
     DeliveryStatus,
+    EventLogEntry,
+    EventSubscription,
     Header,
     RelayRule,
     RetryPolicy,
@@ -100,6 +102,15 @@ class TestBuildHeaders:
         headers = DeliveryEngine.build_headers(active_endpoint, delivery)
         assert headers["X-Override"] == "value"
 
+    def test_event_type_in_header(self, engine, active_endpoint):
+        delivery = WebhookDelivery(
+            endpoint_id=active_endpoint.id,
+            payload={},
+            event_type="order.created",
+        )
+        headers = DeliveryEngine.build_headers(active_endpoint, delivery)
+        assert headers["X-Webhook-Event"] == "order.created"
+
 
 class TestDeliver:
     @pytest.mark.asyncio
@@ -119,6 +130,16 @@ class TestDeliver:
         attempt = await engine.deliver(delivery)
         assert attempt.status == DeliveryStatus.FAILED
         assert "paused" in attempt.error_message.lower()
+
+    @pytest.mark.asyncio
+    async def test_deliver_disabled_endpoint(self, engine, store):
+        ep = WebhookEndpoint(name="Disabled", url="https://example.com", status=WebhookStatus.DISABLED)
+        store.add_endpoint(ep)
+        delivery = WebhookDelivery(endpoint_id=ep.id, payload={})
+        store.add_delivery(delivery)
+        attempt = await engine.deliver(delivery)
+        assert attempt.status == DeliveryStatus.FAILED
+        assert "disabled" in attempt.error_message.lower()
 
     @pytest.mark.asyncio
     async def test_deliver_connection_error(self, engine, store):
@@ -146,6 +167,14 @@ class TestProcessDelivery:
         result = await engine.process_delivery("nonexistent")
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_process_abandoned_when_endpoint_missing(self, engine, store):
+        delivery = WebhookDelivery(endpoint_id="nonexistent", payload={})
+        store.add_delivery(delivery)
+        result = await engine.process_delivery(delivery.id)
+        assert result is not None
+        assert result.status == DeliveryStatus.ABANDONED
+
 
 class TestSend:
     @pytest.mark.asyncio
@@ -167,6 +196,16 @@ class TestSend:
             metadata={"source": "unit-test"},
         )
         assert result.metadata["source"] == "unit-test"
+
+    @pytest.mark.asyncio
+    async def test_send_with_custom_headers(self, engine, store, active_endpoint):
+        result = await engine.send(
+            endpoint_id=active_endpoint.id,
+            payload={"test": True},
+            headers={"X-Custom": "value"},
+        )
+        # Should not raise
+        assert result is not None
 
 
 class TestRelayRules:
@@ -288,3 +327,60 @@ class TestRelayRules:
         # Check the delivery payload wraps the raw body
         delivery = store.get_delivery(delivery_ids[0])
         assert "raw_body" in delivery.payload
+
+    def test_apply_relay_skips_paused_endpoint(self, engine, store):
+        ep = WebhookEndpoint(name="Paused Target", url="https://example.com", status=WebhookStatus.PAUSED)
+        store.add_endpoint(ep)
+
+        rule = RelayRule(
+            name="Paused Target Rule",
+            path_pattern="/test/*",
+            target_endpoint_ids=[ep.id],
+        )
+        store.add_relay_rule(rule)
+
+        delivery_ids = engine.apply_relay_rules(
+            path="/test/event",
+            method="POST",
+            headers={},
+            body={"test": True},
+        )
+        assert len(delivery_ids) == 0
+
+    def test_apply_relay_with_query_params(self, engine, store, active_endpoint):
+        rule = RelayRule(
+            name="Test",
+            path_pattern="/test/*",
+            target_endpoint_ids=[active_endpoint.id],
+        )
+        store.add_relay_rule(rule)
+
+        delivery_ids = engine.apply_relay_rules(
+            path="/test/event",
+            method="POST",
+            headers={},
+            body={},
+            query_params={"key": "value"},
+        )
+        assert len(delivery_ids) == 1
+        incoming = store.list_incoming()
+        assert incoming[0].query_params == {"key": "value"}
+
+    def test_apply_relay_with_source_ip(self, engine, store, active_endpoint):
+        rule = RelayRule(
+            name="Test",
+            path_pattern="/test/*",
+            target_endpoint_ids=[active_endpoint.id],
+        )
+        store.add_relay_rule(rule)
+
+        delivery_ids = engine.apply_relay_rules(
+            path="/test/event",
+            method="POST",
+            headers={},
+            body={},
+            source_ip="10.0.0.1",
+        )
+        assert len(delivery_ids) == 1
+        incoming = store.list_incoming()
+        assert incoming[0].source_ip == "10.0.0.1"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from rich.table import Table
 
 from .models import (
     DeliveryStatus,
+    EventSubscription,
     Header,
     RelayRule,
     RetryPolicy,
@@ -180,6 +182,13 @@ def endpoint_show(ctx: click.Context, endpoint_id: str) -> None:
             console.print(f"    {h.name}: {h.value}")
     console.print(f"  Retry Policy: max={ep.retry_policy.max_retries}, backoff={ep.retry_policy.backoff_multiplier}x")
 
+    # Show subscriptions for this endpoint
+    subs = store.list_subscriptions(endpoint_id=ep.id)
+    if subs:
+        console.print(f"  Subscriptions:")
+        for s in subs:
+            console.print(f"    {s.id[:8]}: {', '.join(s.event_types)}")
+
 
 @endpoint.command("pause")
 @click.argument("endpoint_id")
@@ -314,7 +323,99 @@ def delivery_show(ctx: click.Context, delivery_id: str) -> None:
         console.print(table)
 
 
+@delivery.command("cancel")
+@click.argument("delivery_id")
+@click.pass_context
+def delivery_cancel(ctx: click.Context, delivery_id: str) -> None:
+    """Cancel a pending or retrying delivery."""
+    store = get_store(ctx.obj["store_path"])
+    d = store.get_delivery(delivery_id)
+    if d is None:
+        console.print(f"[red]Delivery not found: {delivery_id}[/red]")
+        sys.exit(1)
+    if d.status in (DeliveryStatus.PENDING, DeliveryStatus.RETRYING):
+        store.update_delivery(d.id, status=DeliveryStatus.ABANDONED)
+        console.print(f"[yellow]✗[/yellow] Delivery {delivery_id[:8]} cancelled.")
+    else:
+        console.print(f"[red]Cannot cancel delivery with status: {d.status.value}[/red]")
+        sys.exit(1)
+
+
 # ── Send Command ───────────────────────────────────────────────────
+
+
+def _run_async(coro):
+    """Run an async coroutine in a fresh event loop."""
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, coro)
+        return future.result()
+
+
+async def _send_and_close(engine, endpoint_id, payload, event_type, headers):
+    """Send a webhook and close the engine client."""
+    try:
+        result = await engine.send(
+            endpoint_id=endpoint_id,
+            payload=payload,
+            event_type=event_type,
+            headers=headers,
+        )
+        return result
+    finally:
+        await engine.close()
+
+
+async def _batch_send_and_close(engine, endpoint_ids, payload, event_type, headers):
+    """Send webhooks to multiple endpoints and close the engine client."""
+    try:
+        results = []
+        for eid in endpoint_ids:
+            result = await engine.send(
+                endpoint_id=eid,
+                payload=payload,
+                event_type=event_type,
+                headers=headers,
+            )
+            results.append(result)
+        return results
+    finally:
+        await engine.close()
+
+
+async def _health_check_and_close(engine, store, endpoint_id):
+    """Run a health check and close the engine client."""
+    try:
+        ep = store.get_endpoint(endpoint_id)
+        test_payload = {
+            "ping": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "agent_webhook_health_check": True,
+        }
+        delivery = WebhookDelivery(
+            endpoint_id=endpoint_id,
+            payload=test_payload,
+            event_type="health_check",
+            metadata={"health_check": True},
+        )
+        store.add_delivery(delivery)
+        attempt = await engine.deliver(delivery)
+        store.add_delivery_attempt(delivery.id, attempt)
+        if attempt.status == DeliveryStatus.SUCCESS:
+            store.update_delivery(delivery.id, status=DeliveryStatus.SUCCESS)
+        else:
+            store.update_delivery(delivery.id, status=DeliveryStatus.ABANDONED)
+        return attempt, ep
+    finally:
+        await engine.close()
+
+
+async def _process_pending_and_close(engine):
+    """Process pending deliveries and close the engine client."""
+    try:
+        return await engine.process_pending()
+    finally:
+        await engine.close()
 
 
 @cli.command("send")
@@ -325,7 +426,6 @@ def delivery_show(ctx: click.Context, delivery_id: str) -> None:
 @click.pass_context
 def send_webhook(ctx: click.Context, endpoint_id: str, payload: str, event_type: str | None, header: tuple[str, ...]) -> None:
     """Send a webhook delivery to an endpoint. Payload is JSON string or stdin."""
-    import asyncio
     store = get_store(ctx.obj["store_path"])
     ep = store.get_endpoint(endpoint_id)
     if ep is None:
@@ -353,13 +453,13 @@ def send_webhook(ctx: click.Context, endpoint_id: str, payload: str, event_type:
 
     from .engine import DeliveryEngine
     engine = DeliveryEngine(store)
-    result = asyncio.run(engine.send(
+    result = _run_async(_send_and_close(
+        engine=engine,
         endpoint_id=endpoint_id,
         payload=payload_data,
         event_type=event_type,
         headers=headers,
     ))
-    asyncio.run(engine.close())
 
     if result.status == DeliveryStatus.SUCCESS:
         console.print(f"[green]✓[/green] Delivered to [bold]{ep.name}[/bold]")
@@ -367,6 +467,152 @@ def send_webhook(ctx: click.Context, endpoint_id: str, payload: str, event_type:
         console.print(f"[cyan]↻[/cyan] Delivery scheduled for retry (attempt {result.current_attempt_number()})")
     else:
         console.print(f"[red]✗[/red] Delivery failed: {result.last_attempt().error_message if result.last_attempt() else 'unknown'}")
+
+
+# ── Batch Send Command ─────────────────────────────────────────────
+
+
+@cli.command("batch-send")
+@click.argument("payload")
+@click.option("--endpoint", "-e", multiple=True, required=True, help="Endpoint IDs to send to")
+@click.option("--event-type", "-t", help="Event type tag")
+@click.option("--header", "-H", multiple=True, help="Extra headers in 'Name: Value' format")
+@click.pass_context
+def batch_send(ctx: click.Context, payload: str, endpoint: tuple[str, ...], event_type: str | None, header: tuple[str, ...]) -> None:
+    """Send a payload to multiple endpoints at once."""
+    store = get_store(ctx.obj["store_path"])
+
+    try:
+        payload_data = json.loads(payload)
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Invalid JSON payload: {e}[/red]")
+        sys.exit(1)
+
+    headers = {}
+    for h in header:
+        if ":" not in h:
+            console.print(f"[red]Invalid header format: {h}[/red]")
+            sys.exit(1)
+        hname, hvalue = h.split(":", 1)
+        headers[hname.strip()] = hvalue.strip()
+
+    from .engine import DeliveryEngine
+    engine = DeliveryEngine(store)
+
+    results = _run_async(_batch_send_and_close(
+        engine=engine,
+        endpoint_ids=list(endpoint),
+        payload=payload_data,
+        event_type=event_type,
+        headers=headers,
+    ))
+
+    success = sum(1 for r in results if r.status == DeliveryStatus.SUCCESS)
+    failed = sum(1 for r in results if r.status in (DeliveryStatus.FAILED, DeliveryStatus.ABANDONED))
+    retrying = sum(1 for r in results if r.status == DeliveryStatus.RETRYING)
+
+    console.print(f"Batch sent to {len(results)} endpoints: [green]{success} success[/green], [red]{failed} failed[/red], [cyan]{retrying} retrying[/cyan]")
+
+
+# ── Subscription Commands ──────────────────────────────────────────
+
+
+@cli.group("subscription")
+def subscription_group() -> None:
+    """Manage event subscriptions."""
+    pass
+
+
+@subscription_group.command("add")
+@click.argument("endpoint_id")
+@click.option("--event-type", "-e", multiple=True, required=True, help="Event types to subscribe to")
+@click.pass_context
+def subscription_add(ctx: click.Context, endpoint_id: str, event_type: tuple[str, ...]) -> None:
+    """Subscribe an endpoint to event types."""
+    store = get_store(ctx.obj["store_path"])
+    ep = store.get_endpoint(endpoint_id)
+    if ep is None:
+        console.print(f"[red]Endpoint not found: {endpoint_id}[/red]")
+        sys.exit(1)
+
+    sub = EventSubscription(
+        endpoint_id=endpoint_id,
+        event_types=list(event_type),
+    )
+    store.add_subscription(sub)
+    console.print(f"[green]✓[/green] Subscription created: [bold]{', '.join(event_type)}[/bold] → {ep.name} (ID: {sub.id})")
+
+
+@subscription_group.command("list")
+@click.option("--endpoint", "-e", help="Filter by endpoint ID")
+@click.pass_context
+def subscription_list(ctx: click.Context, endpoint: str | None) -> None:
+    """List event subscriptions."""
+    store = get_store(ctx.obj["store_path"])
+    subs = store.list_subscriptions(endpoint_id=endpoint)
+
+    if not subs:
+        console.print("[yellow]No subscriptions found.[/yellow]")
+        return
+
+    table = Table(title="Event Subscriptions")
+    table.add_column("ID", style="dim", max_width=12)
+    table.add_column("Endpoint", max_width=20)
+    table.add_column("Event Types")
+    table.add_column("Created")
+
+    for s in subs:
+        ep = store.get_endpoint(s.endpoint_id)
+        ep_name = ep.name[:18] if ep else s.endpoint_id[:8]
+        table.add_row(
+            s.id[:8],
+            ep_name,
+            ", ".join(s.event_types),
+            format_dt(s.created_at),
+        )
+
+    console.print(table)
+
+
+@subscription_group.command("delete")
+@click.argument("subscription_id")
+@click.pass_context
+def subscription_delete(ctx: click.Context, subscription_id: str) -> None:
+    """Delete an event subscription."""
+    store = get_store(ctx.obj["store_path"])
+    if store.delete_subscription(subscription_id):
+        console.print(f"[red]✗[/red] Subscription {subscription_id} deleted.")
+    else:
+        console.print(f"[red]Subscription not found: {subscription_id}[/red]")
+        sys.exit(1)
+
+
+# ── Health Check Command ───────────────────────────────────────────
+
+
+@cli.command("health-check")
+@click.argument("endpoint_id")
+@click.pass_context
+def health_check_cmd(ctx: click.Context, endpoint_id: str) -> None:
+    """Test endpoint connectivity."""
+    store = get_store(ctx.obj["store_path"])
+    ep = store.get_endpoint(endpoint_id)
+    if ep is None:
+        console.print(f"[red]Endpoint not found: {endpoint_id}[/red]")
+        sys.exit(1)
+
+    from .engine import DeliveryEngine
+    engine = DeliveryEngine(store)
+
+    attempt, ep = _run_async(_health_check_and_close(engine, store, endpoint_id))
+
+    if attempt.status == DeliveryStatus.SUCCESS:
+        console.print(f"[green]✓[/green] Endpoint [bold]{ep.name}[/bold] is healthy")
+        console.print(f"  Status code: {attempt.response_status_code}")
+        console.print(f"  Duration:    {attempt.duration_ms:.0f}ms" if attempt.duration_ms else "  Duration:    —")
+    else:
+        console.print(f"[red]✗[/red] Endpoint [bold]{ep.name}[/bold] is unhealthy")
+        console.print(f"  Error: {attempt.error_message or 'unknown'}")
 
 
 # ── Relay Commands ─────────────────────────────────────────────────
@@ -525,6 +771,45 @@ def incoming_list(ctx: click.Context, path: str | None, processed: bool | None, 
     console.print(table)
 
 
+# ── Event Log Command ──────────────────────────────────────────────
+
+
+@cli.command("event-log")
+@click.option("--event-type", "-e", help="Filter by event type")
+@click.option("--endpoint", "-ep", help="Filter by endpoint ID")
+@click.option("--limit", "-n", type=int, default=50)
+@click.pass_context
+def event_log_cmd(ctx: click.Context, event_type: str | None, endpoint: str | None, limit: int) -> None:
+    """Show event audit log."""
+    store = get_store(ctx.obj["store_path"])
+    entries = store.list_event_log(event_type=event_type, endpoint_id=endpoint, limit=limit)
+
+    if not entries:
+        console.print("[yellow]No event log entries found.[/yellow]")
+        return
+
+    table = Table(title="Event Log")
+    table.add_column("Timestamp")
+    table.add_column("Event Type", style="bold")
+    table.add_column("Endpoint")
+    table.add_column("Details")
+
+    for e in entries:
+        ep_name = "—"
+        if e.endpoint_id:
+            ep = store.get_endpoint(e.endpoint_id)
+            ep_name = ep.name[:18] if ep else e.endpoint_id[:8]
+        details = json.dumps(e.details, default=str)[:60] if e.details else "—"
+        table.add_row(
+            format_dt(e.timestamp),
+            e.event_type,
+            ep_name,
+            details,
+        )
+
+    console.print(table)
+
+
 # ── Process Pending ────────────────────────────────────────────────
 
 
@@ -532,12 +817,10 @@ def incoming_list(ctx: click.Context, path: str | None, processed: bool | None, 
 @click.pass_context
 def process_pending_cmd(ctx: click.Context) -> None:
     """Process all pending webhook deliveries."""
-    import asyncio
     store = get_store(ctx.obj["store_path"])
     from .engine import DeliveryEngine
     engine = DeliveryEngine(store)
-    results = asyncio.run(engine.process_pending())
-    asyncio.run(engine.close())
+    results = _run_async(_process_pending_and_close(engine))
 
     if not results:
         console.print("[yellow]No pending deliveries.[/yellow]")

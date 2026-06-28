@@ -180,6 +180,32 @@ class IncomingWebhook(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class EventSubscription(BaseModel):
+    """Subscription linking an endpoint to specific event types."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    endpoint_id: str = Field(..., description="Target endpoint ID")
+    event_types: list[str] = Field(..., min_length=1, description="Event types to subscribe to")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("event_types")
+    @classmethod
+    def validate_event_types(cls, v: list[str]) -> list[str]:
+        for et in v:
+            if not re.match(r"^[a-zA-Z0-9._-]+$", et):
+                raise ValueError(f"Invalid event type: {et}. Use alphanumeric, dots, hyphens, underscores only.")
+        return v
+
+
+class EventLogEntry(BaseModel):
+    """An entry in the webhook event audit log."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    event_type: str = Field(..., description="Type of event (e.g. endpoint.created, delivery.success)")
+    details: dict[str, Any] = Field(default_factory=dict, description="Event details")
+    endpoint_id: str | None = Field(default=None, description="Related endpoint ID")
+    delivery_id: str | None = Field(default=None, description="Related delivery ID")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class RelayRule(BaseModel):
     """A rule that forwards incoming webhooks to registered endpoints."""
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))

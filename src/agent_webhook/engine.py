@@ -62,7 +62,7 @@ class DeliveryEngine:
         """Build headers for a webhook delivery."""
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "agent-webhook/0.1.0",
+            "User-Agent": "agent-webhook/0.2.0",
             "X-Webhook-ID": delivery.id,
             "X-Webhook-Event": delivery.event_type or "generic",
             "X-Webhook-Timestamp": datetime.now(timezone.utc).isoformat(),

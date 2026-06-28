@@ -13,6 +13,7 @@ from mcp.types import TextContent, Tool
 from .engine import DeliveryEngine
 from .models import (
     DeliveryStatus,
+    EventSubscription,
     Header,
     RelayRule,
     WebhookDelivery,
@@ -113,6 +114,21 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                 },
             ),
             Tool(
+                name="webhook_batch_send",
+                description="Send the same payload to multiple endpoints at once",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_ids": {"type": "array", "items": {"type": "string"}, "description": "Target endpoint IDs"},
+                        "payload": {"type": "object", "description": "JSON payload to deliver"},
+                        "event_type": {"type": "string", "description": "Event type tag"},
+                        "headers": {"type": "object", "description": "Extra headers"},
+                        "metadata": {"type": "object", "description": "Extra metadata"},
+                    },
+                    "required": ["endpoint_ids", "payload"],
+                },
+            ),
+            Tool(
                 name="delivery_list",
                 description="List webhook deliveries",
                 inputSchema={
@@ -144,9 +160,27 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                 },
             ),
             Tool(
+                name="delivery_cancel",
+                description="Cancel a pending or retrying delivery",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"delivery_id": {"type": "string"}},
+                    "required": ["delivery_id"],
+                },
+            ),
+            Tool(
                 name="process_pending",
                 description="Process all pending webhook deliveries",
                 inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="health_check",
+                description="Test endpoint connectivity by sending a health check payload",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"endpoint_id": {"type": "string"}},
+                    "required": ["endpoint_id"],
+                },
             ),
             Tool(
                 name="stats",
@@ -154,6 +188,51 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                 inputSchema={
                     "type": "object",
                     "properties": {"endpoint_id": {"type": "string", "description": "Optional endpoint ID (omit for all)"}},
+                },
+            ),
+            Tool(
+                name="subscription_add",
+                description="Subscribe an endpoint to specific event types",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                        "event_types": {"type": "array", "items": {"type": "string"}, "description": "Event types to subscribe to"},
+                    },
+                    "required": ["endpoint_id", "event_types"],
+                },
+            ),
+            Tool(
+                name="subscription_list",
+                description="List event subscriptions",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Filter by endpoint ID"},
+                    },
+                },
+            ),
+            Tool(
+                name="subscription_delete",
+                description="Delete an event subscription",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"subscription_id": {"type": "string"}},
+                    "required": ["subscription_id"],
+                },
+            ),
+            Tool(
+                name="send_to_subscribers",
+                description="Send a payload to all endpoints subscribed to an event type",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "event_type": {"type": "string", "description": "Event type to match"},
+                        "payload": {"type": "object", "description": "JSON payload to deliver"},
+                        "metadata": {"type": "object", "description": "Extra metadata"},
+                        "headers": {"type": "object", "description": "Extra headers"},
+                    },
+                    "required": ["event_type", "payload"],
                 },
             ),
             Tool(
@@ -208,6 +287,18 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                         "source_ip": {"type": "string"},
                     },
                     "required": ["path"],
+                },
+            ),
+            Tool(
+                name="event_log",
+                description="List event log entries for audit trail",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "event_type": {"type": "string", "description": "Filter by event type"},
+                        "endpoint_id": {"type": "string", "description": "Filter by endpoint ID"},
+                        "limit": {"type": "integer", "default": 50},
+                    },
                 },
             ),
         ]
@@ -274,6 +365,31 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                 )
                 return [TextContent(type="text", text=json.dumps(result.model_dump(mode="json"), default=str, indent=2))]
 
+            elif name == "webhook_batch_send":
+                endpoint_ids = arguments["endpoint_ids"]
+                payload = arguments["payload"]
+                event_type = arguments.get("event_type")
+                headers = arguments.get("headers", {})
+                metadata = arguments.get("metadata", {})
+                results = []
+                for eid in endpoint_ids:
+                    result = await engine.send(
+                        endpoint_id=eid,
+                        payload=payload,
+                        event_type=event_type,
+                        metadata=metadata,
+                        headers=headers,
+                    )
+                    results.append(result)
+                summary = {
+                    "total": len(results),
+                    "success": sum(1 for r in results if r.status == DeliveryStatus.SUCCESS),
+                    "failed": sum(1 for r in results if r.status in (DeliveryStatus.FAILED, DeliveryStatus.ABANDONED)),
+                    "retrying": sum(1 for r in results if r.status == DeliveryStatus.RETRYING),
+                    "deliveries": [{"id": r.id, "endpoint_id": r.endpoint_id, "status": r.status.value} for r in results],
+                }
+                return [TextContent(type="text", text=json.dumps(summary, default=str, indent=2))]
+
             elif name == "delivery_list":
                 ds = DeliveryStatus(arguments["status"]) if "status" in arguments else None
                 deliveries = store.list_deliveries(
@@ -301,11 +417,57 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                 result = await engine.process_delivery(d.id)
                 return [TextContent(type="text", text=json.dumps(result.model_dump(mode="json"), default=str, indent=2)) if result else TextContent(type="text", text=f"Failed to retry delivery: {arguments['delivery_id']}")]
 
+            elif name == "delivery_cancel":
+                d = store.get_delivery(arguments["delivery_id"])
+                if d is None:
+                    return [TextContent(type="text", text=f"Delivery not found: {arguments['delivery_id']}")]
+                if d.status in (DeliveryStatus.PENDING, DeliveryStatus.RETRYING):
+                    store.update_delivery(d.id, status=DeliveryStatus.ABANDONED)
+                    return [TextContent(type="text", text=f"Delivery cancelled: {arguments['delivery_id']}")]
+                else:
+                    return [TextContent(type="text", text=f"Cannot cancel delivery with status: {d.status.value}")]
+
             elif name == "process_pending":
                 results = await engine.process_pending()
                 return [TextContent(type="text", text=json.dumps(
                     [r.model_dump(mode="json") for r in results], default=str, indent=2
                 ))]
+
+            elif name == "health_check":
+                ep = store.get_endpoint(arguments["endpoint_id"])
+                if ep is None:
+                    return [TextContent(type="text", text=f"Endpoint not found: {arguments['endpoint_id']}")]
+                # Create a test delivery
+                from datetime import datetime, timezone
+                test_payload = {
+                    "ping": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "agent_webhook_health_check": True,
+                }
+                delivery = WebhookDelivery(
+                    endpoint_id=arguments["endpoint_id"],
+                    payload=test_payload,
+                    event_type="health_check",
+                    metadata={"health_check": True},
+                )
+                store.add_delivery(delivery)
+                attempt = await engine.deliver(delivery)
+                store.add_delivery_attempt(delivery.id, attempt)
+                if attempt.status == DeliveryStatus.SUCCESS:
+                    store.update_delivery(delivery.id, status=DeliveryStatus.SUCCESS)
+                else:
+                    store.update_delivery(delivery.id, status=DeliveryStatus.ABANDONED)
+                result = {
+                    "endpoint_id": arguments["endpoint_id"],
+                    "endpoint_name": ep.name,
+                    "url": ep.url,
+                    "healthy": attempt.status == DeliveryStatus.SUCCESS,
+                    "status_code": attempt.response_status_code,
+                    "duration_ms": attempt.duration_ms,
+                    "error": attempt.error_message,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
 
             elif name == "stats":
                 if "endpoint_id" in arguments:
@@ -315,6 +477,61 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                 else:
                     s = store.get_all_stats()
                 return [TextContent(type="text", text=json.dumps(s, default=str, indent=2))]
+
+            elif name == "subscription_add":
+                ep = store.get_endpoint(arguments["endpoint_id"])
+                if ep is None:
+                    return [TextContent(type="text", text=f"Endpoint not found: {arguments['endpoint_id']}")]
+                sub = EventSubscription(
+                    endpoint_id=arguments["endpoint_id"],
+                    event_types=arguments["event_types"],
+                )
+                store.add_subscription(sub)
+                return [TextContent(type="text", text=json.dumps(sub.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "subscription_list":
+                subs = store.list_subscriptions(endpoint_id=arguments.get("endpoint_id"))
+                return [TextContent(type="text", text=json.dumps(
+                    [s.model_dump(mode="json") for s in subs], default=str, indent=2
+                ))]
+
+            elif name == "subscription_delete":
+                deleted = store.delete_subscription(arguments["subscription_id"])
+                return [TextContent(type="text", text=f"Subscription deleted: {arguments['subscription_id']}" if deleted else f"Subscription not found: {arguments['subscription_id']}")]
+
+            elif name == "send_to_subscribers":
+                event_type = arguments["event_type"]
+                payload = arguments["payload"]
+                metadata = arguments.get("metadata", {})
+                headers = arguments.get("headers", {})
+                # Find all subscribed endpoints
+                subs = store.list_subscriptions()
+                matching_endpoint_ids = []
+                for sub in subs:
+                    if event_type in sub.event_types:
+                        ep = store.get_endpoint(sub.endpoint_id)
+                        if ep and ep.is_active():
+                            matching_endpoint_ids.append(sub.endpoint_id)
+                if not matching_endpoint_ids:
+                    return [TextContent(type="text", text=json.dumps({"message": f"No active subscribers for event type: {event_type}", "delivered": 0}))]
+                results = []
+                for eid in matching_endpoint_ids:
+                    result = await engine.send(
+                        endpoint_id=eid,
+                        payload=payload,
+                        event_type=event_type,
+                        metadata=metadata,
+                        headers=headers,
+                    )
+                    results.append(result)
+                summary = {
+                    "event_type": event_type,
+                    "subscribers": len(matching_endpoint_ids),
+                    "success": sum(1 for r in results if r.status == DeliveryStatus.SUCCESS),
+                    "failed": sum(1 for r in results if r.status in (DeliveryStatus.FAILED, DeliveryStatus.ABANDONED)),
+                    "deliveries": [{"id": r.id, "endpoint_id": r.endpoint_id, "status": r.status.value} for r in results],
+                }
+                return [TextContent(type="text", text=json.dumps(summary, default=str, indent=2))]
 
             elif name == "relay_add":
                 rule = RelayRule(
@@ -356,6 +573,16 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                 )
                 result = {"forwarded_deliveries": delivery_ids, "count": len(delivery_ids)}
                 return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "event_log":
+                entries = store.list_event_log(
+                    event_type=arguments.get("event_type"),
+                    endpoint_id=arguments.get("endpoint_id"),
+                    limit=arguments.get("limit", 50),
+                )
+                return [TextContent(type="text", text=json.dumps(
+                    [e.model_dump(mode="json") for e in entries], default=str, indent=2
+                ))]
 
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]

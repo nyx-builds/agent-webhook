@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from agent_webhook.models import (
     DeliveryAttempt,
     DeliveryStatus,
+    EventLogEntry,
+    EventSubscription,
     Header,
     IncomingWebhook,
     RelayRule,
@@ -13,6 +15,7 @@ from agent_webhook.models import (
     WebhookDelivery,
     WebhookEndpoint,
     WebhookMethod,
+    WebhookStats,
     WebhookStatus,
 )
 
@@ -103,6 +106,13 @@ class TestWebhookEndpoint:
         ep.status = WebhookStatus.DISABLED
         assert not ep.is_active()
 
+    def test_updated_at_changes(self):
+        ep = WebhookEndpoint(name="Test", url="https://example.com")
+        original = ep.updated_at
+        ep.name = "Updated"
+        # updated_at only changes via store update, not model mutation
+        assert ep.updated_at == original
+
 
 class TestWebhookDelivery:
     def test_create_delivery(self):
@@ -148,6 +158,92 @@ class TestWebhookDelivery:
         assert not d.can_retry(policy)
 
 
+class TestEventSubscription:
+    def test_create_basic(self):
+        sub = EventSubscription(
+            endpoint_id="ep-1",
+            event_types=["order.created", "order.updated"],
+        )
+        assert sub.endpoint_id == "ep-1"
+        assert len(sub.event_types) == 2
+        assert "order.created" in sub.event_types
+        assert sub.created_at is not None
+
+    def test_invalid_event_type(self):
+        with pytest.raises(Exception):
+            EventSubscription(endpoint_id="ep-1", event_types=["has space"])
+
+    def test_empty_event_types(self):
+        with pytest.raises(Exception):
+            EventSubscription(endpoint_id="ep-1", event_types=[])
+
+    def test_valid_special_chars(self):
+        sub = EventSubscription(
+            endpoint_id="ep-1",
+            event_types=["order.created", "user-updated", "payment_succeeded"],
+        )
+        assert len(sub.event_types) == 3
+
+
+class TestEventLogEntry:
+    def test_create_basic(self):
+        entry = EventLogEntry(
+            event_type="endpoint.created",
+            details={"name": "Test"},
+            endpoint_id="ep-1",
+        )
+        assert entry.event_type == "endpoint.created"
+        assert entry.details == {"name": "Test"}
+        assert entry.endpoint_id == "ep-1"
+        assert entry.delivery_id is None
+        assert entry.timestamp is not None
+
+    def test_with_delivery(self):
+        entry = EventLogEntry(
+            event_type="delivery.success",
+            details={"status_code": 200},
+            endpoint_id="ep-1",
+            delivery_id="d-1",
+        )
+        assert entry.delivery_id == "d-1"
+
+    def test_defaults(self):
+        entry = EventLogEntry(event_type="test")
+        assert entry.details == {}
+        assert entry.endpoint_id is None
+        assert entry.delivery_id is None
+
+
+class TestWebhookStats:
+    def test_success_rate_none_when_no_completed(self):
+        stats = WebhookStats(
+            endpoint_id="ep-1",
+            endpoint_name="Test",
+            total_deliveries=0,
+        )
+        assert stats.success_rate is None
+
+    def test_success_rate_calculation(self):
+        stats = WebhookStats(
+            endpoint_id="ep-1",
+            endpoint_name="Test",
+            total_deliveries=10,
+            successful=8,
+            failed=2,
+        )
+        assert stats.success_rate == 0.8
+
+    def test_success_rate_includes_abandoned(self):
+        stats = WebhookStats(
+            endpoint_id="ep-1",
+            endpoint_name="Test",
+            successful=5,
+            failed=2,
+            abandoned=3,
+        )
+        assert stats.success_rate == 0.5
+
+
 class TestRelayRule:
     def test_create_rule(self):
         rule = RelayRule(
@@ -178,6 +274,12 @@ class TestRelayRule:
         assert rule.matches_path("/anything")
         assert rule.matches_path("/nested/path")
 
+    def test_matches_nested_wildcard(self):
+        rule = RelayRule(name="Nested", path_pattern="/api/v1/*", target_endpoint_ids=["ep-1"])
+        assert rule.matches_path("/api/v1/users")
+        assert rule.matches_path("/api/v1/orders/123")
+        assert not rule.matches_path("/api/v2/users")
+
 
 class TestIncomingWebhook:
     def test_create(self):
@@ -189,3 +291,19 @@ class TestIncomingWebhook:
         )
         assert not iw.processed
         assert len(iw.forwarded_to) == 0
+
+    def test_with_query_params(self):
+        iw = IncomingWebhook(
+            path="/webhook",
+            method="GET",
+            query_params={"verify": "token123"},
+        )
+        assert iw.query_params == {"verify": "token123"}
+
+    def test_with_source_ip(self):
+        iw = IncomingWebhook(
+            path="/webhook",
+            method="POST",
+            source_ip="192.168.1.1",
+        )
+        assert iw.source_ip == "192.168.1.1"

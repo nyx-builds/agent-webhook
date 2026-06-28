@@ -10,6 +10,8 @@ from typing import Any
 from .models import (
     DeliveryAttempt,
     DeliveryStatus,
+    EventLogEntry,
+    EventSubscription,
     IncomingWebhook,
     RelayRule,
     WebhookDelivery,
@@ -29,6 +31,8 @@ class WebhookStore:
             "deliveries": {},
             "incoming": {},
             "relay_rules": {},
+            "subscriptions": {},
+            "event_log": [],
         }
         self._load()
 
@@ -48,6 +52,12 @@ class WebhookStore:
             # Parse relay rules
             for rid, rdata in raw.get("relay_rules", {}).items():
                 self._data["relay_rules"][rid] = RelayRule.model_validate(rdata)
+            # Parse subscriptions
+            for sid, sdata in raw.get("subscriptions", {}).items():
+                self._data["subscriptions"][sid] = EventSubscription.model_validate(sdata)
+            # Parse event log
+            for edata in raw.get("event_log", []):
+                self._data["event_log"].append(EventLogEntry.model_validate(edata))
 
     def _save(self) -> None:
         serializable = {
@@ -55,6 +65,8 @@ class WebhookStore:
             "deliveries": {k: v.model_dump(mode="json") for k, v in self._data["deliveries"].items()},
             "incoming": {k: v.model_dump(mode="json") for k, v in self._data["incoming"].items()},
             "relay_rules": {k: v.model_dump(mode="json") for k, v in self._data["relay_rules"].items()},
+            "subscriptions": {k: v.model_dump(mode="json") for k, v in self._data["subscriptions"].items()},
+            "event_log": [e.model_dump(mode="json") for e in self._data["event_log"]],
         }
         tmp = self._path.with_suffix(".tmp")
         with open(tmp, "w") as f:
@@ -262,6 +274,58 @@ class WebhookStore:
 
     def get_all_stats(self) -> list[dict[str, Any]]:
         return [self.get_stats(eid) for eid in self._data["endpoints"] if self.get_stats(eid) is not None]
+
+    # --- Event Subscriptions ---
+
+    def add_subscription(self, sub: EventSubscription) -> EventSubscription:
+        with self._lock:
+            self._data["subscriptions"][sub.id] = sub
+            self._save()
+        return sub
+
+    def get_subscription(self, subscription_id: str) -> EventSubscription | None:
+        return self._data["subscriptions"].get(subscription_id)
+
+    def list_subscriptions(
+        self,
+        endpoint_id: str | None = None,
+    ) -> list[EventSubscription]:
+        subs = list(self._data["subscriptions"].values())
+        if endpoint_id is not None:
+            subs = [s for s in subs if s.endpoint_id == endpoint_id]
+        return sorted(subs, key=lambda s: s.created_at)
+
+    def delete_subscription(self, subscription_id: str) -> bool:
+        with self._lock:
+            if subscription_id not in self._data["subscriptions"]:
+                return False
+            del self._data["subscriptions"][subscription_id]
+            self._save()
+        return True
+
+    # --- Event Log ---
+
+    def add_event_log(self, entry: EventLogEntry) -> EventLogEntry:
+        with self._lock:
+            self._data["event_log"].append(entry)
+            # Keep only the last 1000 entries to prevent unbounded growth
+            if len(self._data["event_log"]) > 1000:
+                self._data["event_log"] = self._data["event_log"][-1000:]
+            self._save()
+        return entry
+
+    def list_event_log(
+        self,
+        event_type: str | None = None,
+        endpoint_id: str | None = None,
+        limit: int = 100,
+    ) -> list[EventLogEntry]:
+        entries = list(self._data["event_log"])
+        if event_type is not None:
+            entries = [e for e in entries if e.event_type == event_type]
+        if endpoint_id is not None:
+            entries = [e for e in entries if e.endpoint_id == endpoint_id]
+        return sorted(entries, key=lambda e: e.timestamp, reverse=True)[:limit]
 
     def pending_deliveries(self) -> list[WebhookDelivery]:
         """Get all deliveries that are pending or retrying and due for delivery."""
