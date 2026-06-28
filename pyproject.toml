@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-webhook"
+version = "0.1.0"
+description = "Webhook management, delivery, and relay service for autonomous agents — MCP server + CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Nyx Builds", email = "nyx-builds@users.noreply.github.com"}]
+dependencies = [
+    "pydantic>=2.0",
+    "httpx>=0.25",
+    "click>=8.0",
+    "rich>=13.0",
+    "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "respx>=0.20"]
+
+[project.scripts]
+agent-webhook = "agent_webhook.cli:cli"
+agent-webhook-mcp = "agent_webhook.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
