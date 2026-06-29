@@ -14,11 +14,17 @@ from rich.console import Console
 from rich.table import Table
 
 from .models import (
+    DeadLetterEntry,
     DeliveryStatus,
     EventSubscription,
     Header,
+    PayloadTransform,
+    RateLimit,
+    RateLimitPeriod,
     RelayRule,
     RetryPolicy,
+    SigningAlgorithm,
+    TransformType,
     WebhookDelivery,
     WebhookEndpoint,
     WebhookMethod,
@@ -28,11 +34,23 @@ from .store import WebhookStore
 
 console = Console()
 
-DEFAULT_STORE_PATH = "webhook_store.json"
+DEFAULT_STORE_PATH = "webhook_store.db"
+
+
+def _get_store_impl(store_path: str | None = None):
+    """Get the best store implementation (SQLite if available)."""
+    path = store_path or DEFAULT_STORE_PATH
+    if path.endswith(".db"):
+        try:
+            from .store_sqlite import SQLiteStore
+            return SQLiteStore(path)
+        except Exception:
+            pass
+    return WebhookStore(path)
 
 
 def get_store(store_path: str | None = None) -> WebhookStore:
-    return WebhookStore(store_path or DEFAULT_STORE_PATH)
+    return _get_store_impl(store_path)
 
 
 def format_dt(dt: datetime | None) -> str:
@@ -831,6 +849,440 @@ def process_pending_cmd(ctx: click.Context) -> None:
     failed = sum(1 for r in results if r.status in (DeliveryStatus.FAILED, DeliveryStatus.ABANDONED))
 
     console.print(f"Processed {len(results)} deliveries: [green]{success} success[/green], [cyan]{retrying} retrying[/cyan], [red]{failed} failed[/red]")
+
+
+# ── Transform Commands ─────────────────────────────────────────────
+
+
+@cli.group("transform")
+def transform_group() -> None:
+    """Manage payload transformations."""
+    pass
+
+
+@transform_group.command("create")
+@click.argument("name")
+@click.option("--type", "-t", "transform_type", type=click.Choice(["field_map", "filter", "template"]), required=True, help="Transform type")
+@click.option("--mapping", "-m", multiple=True, help="Field mapping 'old:new' (for field_map)")
+@click.option("--include", "-i", multiple=True, help="Fields to include (for filter)")
+@click.option("--exclude", "-x", multiple=True, help="Fields to exclude (for filter)")
+@click.option("--keep-unmapped", is_flag=True, default=True, help="Keep unmapped fields (for field_map)")
+@click.option("--field", "-f", multiple=True, help="Template field 'key={{payload.path}}' (for template)")
+@click.pass_context
+def transform_create(ctx: click.Context, name: str, transform_type: str, mapping: tuple, include: tuple, exclude: tuple, keep_unmapped: bool, field: tuple) -> None:
+    """Create a payload transformation."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "add_transform"):
+        console.print("[red]Transforms require SQLite store. Use --store with .db path.[/red]")
+        sys.exit(1)
+
+    config: dict[str, Any] = {}
+    if transform_type == "field_map":
+        config["mapping"] = {m.split(":")[0]: m.split(":", 1)[1] for m in mapping if ":" in m}
+        config["keep_unmapped"] = keep_unmapped
+    elif transform_type == "filter":
+        if include:
+            config["include"] = list(include)
+        elif exclude:
+            config["exclude"] = list(exclude)
+        else:
+            console.print("[red]Filter requires --include or --exclude[/red]")
+            sys.exit(1)
+    elif transform_type == "template":
+        if field:
+            config["fields"] = {f.split("=")[0]: f.split("=", 1)[1] for f in field if "=" in f}
+        else:
+            console.print("[red]Template requires --field options[/red]")
+            sys.exit(1)
+
+    transform = PayloadTransform(name=name, type=TransformType(transform_type), config=config)
+    store.add_transform(transform)
+    console.print(f"[green]✓[/green] Transform created: [bold]{transform.name}[/bold] (ID: {transform.id}, type: {transform_type})")
+
+
+@transform_group.command("list")
+@click.option("--type", "-t", "transform_type", help="Filter by type")
+@click.pass_context
+def transform_list(ctx: click.Context, transform_type: str | None) -> None:
+    """List payload transforms."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "list_transforms"):
+        console.print("[red]Transforms require SQLite store.[/red]")
+        sys.exit(1)
+    transforms = store.list_transforms(type=transform_type)
+    if not transforms:
+        console.print("[yellow]No transforms found.[/yellow]")
+        return
+    table = Table(title="Payload Transforms")
+    table.add_column("ID", style="dim", max_width=12)
+    table.add_column("Name", style="bold")
+    table.add_column("Type")
+    table.add_column("Config", max_width=50)
+    table.add_column("Created")
+    for t in transforms:
+        config_str = json.dumps(t.config, default=str)[:48]
+        table.add_row(t.id[:8], t.name, t.type.value, config_str, format_dt(t.created_at))
+    console.print(table)
+
+
+@transform_group.command("delete")
+@click.argument("transform_id")
+@click.pass_context
+def transform_delete(ctx: click.Context, transform_id: str) -> None:
+    """Delete a payload transform."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "delete_transform"):
+        console.print("[red]Transforms require SQLite store.[/red]")
+        sys.exit(1)
+    if store.delete_transform(transform_id):
+        console.print(f"[red]✗[/red] Transform {transform_id} deleted.")
+    else:
+        console.print(f"[red]Transform not found: {transform_id}[/red]")
+        sys.exit(1)
+
+
+@transform_group.command("show")
+@click.argument("transform_id")
+@click.pass_context
+def transform_show(ctx: click.Context, transform_id: str) -> None:
+    """Show details of a payload transform."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "get_transform"):
+        console.print("[red]Transforms require SQLite store.[/red]")
+        sys.exit(1)
+    t = store.get_transform(transform_id)
+    if t is None:
+        console.print(f"[red]Transform not found: {transform_id}[/red]")
+        sys.exit(1)
+    console.print(f"\n[bold]Transform: {t.name}[/bold]")
+    console.print(f"  ID:      {t.id}")
+    console.print(f"  Type:    {t.type.value}")
+    console.print(f"  Config:  {json.dumps(t.config, default=str, indent=4)}")
+    console.print(f"  Created: {format_dt(t.created_at)}")
+
+
+@transform_group.command("update")
+@click.argument("transform_id")
+@click.option("--name", "-n", default=None, help="New transform name")
+@click.option("--config", "-c", default=None, help="New config as JSON string")
+@click.pass_context
+def transform_update(ctx: click.Context, transform_id: str, name: str | None, config: str | None) -> None:
+    """Update a payload transform."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "update_transform"):
+        console.print("[red]Transforms require SQLite store.[/red]")
+        sys.exit(1)
+    updates: dict[str, Any] = {}
+    if name is not None:
+        updates["name"] = name
+    if config is not None:
+        try:
+            updates["config"] = json.loads(config)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]Invalid JSON config: {e}[/red]")
+            sys.exit(1)
+    if not updates:
+        console.print("[yellow]No updates specified. Use --name or --config.[/yellow]")
+        return
+    t = store.update_transform(transform_id, **updates)
+    if t is None:
+        console.print(f"[red]Transform not found: {transform_id}[/red]")
+        sys.exit(1)
+    console.print(f"[green]✓[/green] Transform {transform_id[:8]} updated.")
+
+
+# ── Dead Letter Queue Commands ────────────────────────────────────
+
+
+@cli.group("dlq")
+def dlq_group() -> None:
+    """Manage dead letter queue (failed deliveries)."""
+    pass
+
+
+@dlq_group.command("list")
+@click.option("--endpoint", "-e", help="Filter by endpoint ID")
+@click.option("--replayed/--not-replayed", default=None, help="Filter by replayed status")
+@click.option("--limit", "-n", type=int, default=50)
+@click.pass_context
+def dlq_list(ctx: click.Context, endpoint: str | None, replayed: bool | None, limit: int) -> None:
+    """List dead letter queue entries."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "list_dead_letter"):
+        console.print("[red]Dead letter queue requires SQLite store.[/red]")
+        sys.exit(1)
+    entries = store.list_dead_letter(endpoint_id=endpoint, replayed=replayed, limit=limit)
+    if not entries:
+        console.print("[yellow]No dead letter entries.[/yellow]")
+        return
+    table = Table(title="Dead Letter Queue")
+    table.add_column("ID", style="dim", max_width=12)
+    table.add_column("Endpoint", max_width=18)
+    table.add_column("Event")
+    table.add_column("Reason", max_width=40)
+    table.add_column("Attempts")
+    table.add_column("Replayed")
+    table.add_column("Created")
+    for e in entries:
+        ep = store.get_endpoint(e.endpoint_id)
+        ep_name = ep.name[:16] if ep else e.endpoint_id[:8]
+        reason = (e.reason or "—")[:38]
+        replayed_str = "[green]Yes[/green]" if e.replayed else "[red]No[/red]"
+        table.add_row(e.id[:8], ep_name, e.event_type or "—", reason, str(e.total_attempts), replayed_str, format_dt(e.created_at))
+    console.print(table)
+
+
+@dlq_group.command("show")
+@click.argument("entry_id")
+@click.pass_context
+def dlq_show(ctx: click.Context, entry_id: str) -> None:
+    """Show dead letter entry details."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "get_dead_letter"):
+        console.print("[red]Dead letter queue requires SQLite store.[/red]")
+        sys.exit(1)
+    entry = store.get_dead_letter(entry_id)
+    if entry is None:
+        console.print(f"[red]Entry not found: {entry_id}[/red]")
+        sys.exit(1)
+    console.print(f"\n[bold]Dead Letter Entry: {entry.id}[/bold]")
+    console.print(f"  Original Delivery: {entry.delivery_id}")
+    console.print(f"  Endpoint:          {entry.endpoint_id}")
+    console.print(f"  Event Type:        {entry.event_type or '—'}")
+    console.print(f"  Reason:            {entry.reason}")
+    console.print(f"  Total Attempts:    {entry.total_attempts}")
+    console.print(f"  Last Status Code:  {entry.last_status_code or '—'}")
+    console.print(f"  Last Error:        {entry.last_error or '—'}")
+    console.print(f"  Replayed:          {'Yes → ' + entry.replayed_delivery_id if entry.replayed else 'No'}")
+    console.print(f"  Created:           {format_dt(entry.created_at)}")
+    console.print(f"  Payload:           {json.dumps(entry.payload, default=str)[:200]}")
+
+
+@dlq_group.command("replay")
+@click.argument("entry_id")
+@click.pass_context
+def dlq_replay(ctx: click.Context, entry_id: str) -> None:
+    """Replay a dead letter entry (create a new delivery)."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "get_dead_letter"):
+        console.print("[red]Dead letter queue requires SQLite store.[/red]")
+        sys.exit(1)
+    entry = store.get_dead_letter(entry_id)
+    if entry is None:
+        console.print(f"[red]Entry not found: {entry_id}[/red]")
+        sys.exit(1)
+    if entry.replayed:
+        console.print(f"[yellow]Already replayed (delivery: {entry.replayed_delivery_id})[/yellow]")
+        sys.exit(1)
+    from .engine import DeliveryEngine
+    engine = DeliveryEngine(store)
+    async def _replay():
+        result = await engine.send(
+            endpoint_id=entry.endpoint_id,
+            payload=entry.payload,
+            event_type=entry.event_type,
+            metadata={"replayed_from_dlq": entry.id, "original_delivery_id": entry.delivery_id},
+        )
+        await engine.close()
+        return result
+    result = _run_async(_replay())
+    store.update_dead_letter(entry_id, replayed=True, replayed_delivery_id=result.id, replayed_at=datetime.now(timezone.utc))
+    if result.status == DeliveryStatus.SUCCESS:
+        console.print(f"[green]✓[/green] Replayed: new delivery [bold]{result.id[:8]}[/bold] succeeded")
+    elif result.status == DeliveryStatus.RETRYING:
+        console.print(f"[cyan]↻[/cyan] Replayed: new delivery [bold]{result.id[:8]}[/bold] scheduled for retry")
+    else:
+        console.print(f"[red]✗[/red] Replayed: new delivery [bold]{result.id[:8]}[/bold] failed")
+
+
+@dlq_group.command("delete")
+@click.argument("entry_id")
+@click.pass_context
+def dlq_delete(ctx: click.Context, entry_id: str) -> None:
+    """Delete a dead letter entry."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "delete_dead_letter"):
+        console.print("[red]Dead letter queue requires SQLite store.[/red]")
+        sys.exit(1)
+    if store.delete_dead_letter(entry_id):
+        console.print(f"[red]✗[/red] Dead letter entry {entry_id} deleted.")
+    else:
+        console.print(f"[red]Entry not found: {entry_id}[/red]")
+        sys.exit(1)
+
+
+# ── Migrate Command ────────────────────────────────────────────────
+
+
+@cli.command("migrate")
+@click.argument("json_path")
+@click.pass_context
+def migrate_cmd(ctx: click.Context, json_path: str) -> None:
+    """Migrate data from a JSON store to SQLite."""
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "migrate_from_json"):
+        console.print("[red]Migration requires SQLite store. Use --store with .db path.[/red]")
+        sys.exit(1)
+    from pathlib import Path
+    if not Path(json_path).exists():
+        console.print(f"[red]File not found: {json_path}[/red]")
+        sys.exit(1)
+    counts = store.migrate_from_json(json_path)
+    console.print("[green]✓[/green] Migration complete:")
+    for key, count in counts.items():
+        console.print(f"  {key}: {count}")
+
+
+# ── v0.4.0 New Commands ──────────────────────────────────────────
+
+
+@dlq_group.command("batch-replay")
+@click.option("--endpoint", "-e", default=None, help="Filter by endpoint ID")
+@click.pass_context
+def dlq_batch_replay(ctx: click.Context, endpoint: str | None) -> None:
+    """Replay all unreplayed dead letter entries."""
+    from .engine import DeliveryEngine
+    from .service import WebhookService
+
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "list_dead_letter"):
+        console.print("[red]Dead letter queue requires SQLite store.[/red]")
+        sys.exit(1)
+
+    service = WebhookService(store_path=ctx.obj["store_path"])
+    results = asyncio.run(service.batch_replay_dead_letter(endpoint_id=endpoint))
+
+    if not results:
+        console.print("[yellow]No dead letter entries to replay.[/yellow]")
+        return
+
+    table = Table(title="Batch Replay Results")
+    table.add_column("Delivery ID", style="cyan")
+    table.add_column("Endpoint ID", style="magenta")
+    table.add_column("Status", style="green")
+    for r in results:
+        table.add_row(r.id[:8], r.endpoint_id[:8], r.status.value)
+    console.print(table)
+    console.print(f"[green]✓[/green] Replayed {len(results)} entries.")
+
+
+@relay_group.command("update")
+@click.argument("rule_id")
+@click.option("--name", "-n", default=None, help="New rule name")
+@click.option("--path-pattern", "-p", default=None, help="New path pattern")
+@click.option("--target", "-t", multiple=True, help="New target endpoint IDs")
+@click.option("--active/--inactive", default=None, help="Enable or disable the rule")
+@click.option("--tag", multiple=True, help="New tags")
+@click.pass_context
+def relay_update(ctx: click.Context, rule_id: str, name: str | None, path_pattern: str | None, target: tuple[str, ...], active: bool | None, tag: tuple[str, ...]) -> None:
+    """Update a relay rule."""
+    from .service import WebhookService
+
+    store = get_store(ctx.obj["store_path"])
+    if not hasattr(store, "update_relay_rule"):
+        console.print("[red]Relay rule updates require SQLite store.[/red]")
+        sys.exit(1)
+
+    updates: dict[str, Any] = {}
+    if name is not None:
+        updates["name"] = name
+    if path_pattern is not None:
+        updates["path_pattern"] = path_pattern
+    if target:
+        updates["target_endpoint_ids"] = list(target)
+    if active is not None:
+        updates["active"] = active
+    if tag:
+        updates["tags"] = list(tag)
+
+    if not updates:
+        console.print("[yellow]No updates specified. Use --name, --path-pattern, --target, --active/--inactive, or --tag.[/yellow]")
+        return
+
+    rule = store.update_relay_rule(rule_id, **updates)
+    if rule is None:
+        console.print(f"[red]Relay rule not found: {rule_id}[/red]")
+        sys.exit(1)
+    console.print(f"[green]✓[/green] Relay rule {rule_id} updated.")
+    console.print(f"  Name: {rule.name}")
+    console.print(f"  Pattern: {rule.path_pattern}")
+    console.print(f"  Targets: {', '.join(rule.target_endpoint_ids)}")
+    console.print(f"  Active: {rule.active}")
+
+
+@cli.command("metrics")
+@click.option("--format", "fmt", type=click.Choice(["json", "prometheus"]), default="json", help="Output format")
+@click.pass_context
+def metrics_cmd(ctx: click.Context, fmt: str) -> None:
+    """Show webhook delivery metrics."""
+    from .metrics import get_metrics
+
+    m = get_metrics()
+    if fmt == "prometheus":
+        console.print(m.generate_prometheus())
+    else:
+        data = m.get_json()
+        console.print_json(json.dumps(data, default=str, indent=2))
+
+
+@cli.command("rate-limit-status")
+@click.argument("endpoint_id")
+@click.pass_context
+def rate_limit_status_cmd(ctx: click.Context, endpoint_id: str) -> None:
+    """Show rate limit status for an endpoint."""
+    store = get_store(ctx.obj["store_path"])
+    ep = store.get_endpoint(endpoint_id)
+    if ep is None:
+        console.print(f"[red]Endpoint not found: {endpoint_id}[/red]")
+        sys.exit(1)
+    if ep.rate_limit is None:
+        console.print(f"[yellow]No rate limit configured for endpoint '{ep.name}'[/yellow]")
+        return
+    from .engine import DeliveryEngine
+    engine = DeliveryEngine(store)
+    status = engine._rate_limiter.get_status(endpoint_id, ep.rate_limit)
+    console.print(f"\n[bold]Rate Limit Status: {ep.name}[/bold]")
+    console.print(f"  Limit:      {status['limit']} requests per {status['period']}")
+    console.print(f"  Burst:      {status['burst']}")
+    console.print(f"  Current:    {status['current_count']}")
+    console.print(f"  Remaining:  {status['remaining']}")
+    if status.get("reset_at"):
+        console.print(f"  Resets at:  {status['reset_at']:.1f}s from now")
+
+
+@cli.command("rest-api")
+@click.option("--host", default="0.0.0.0", help="Host to bind to")
+@click.option("--port", default=8000, type=int, help="Port to bind to")
+@click.option("--store", "store_path", default=DEFAULT_STORE_PATH, help="Path to store file")
+@click.pass_context
+def rest_api_cmd(ctx: click.Context, host: str, port: int, store_path: str) -> None:
+    """Start the REST API server."""
+    try:
+        import uvicorn
+    except ImportError:
+        console.print("[red]uvicorn is required for the REST API server. Install with: pip install agent-webhook[rest][/red]")
+        sys.exit(1)
+
+    from .rest_api import create_app
+
+    console.print(f"[green]Starting REST API server on {host}:{port}[/green]")
+    console.print(f"Store: {store_path}")
+    console.print("Endpoints:")
+    console.print(f"  GET  /health              - Health check")
+    console.print(f"  POST /endpoints           - Create endpoint")
+    console.print(f"  GET  /endpoints           - List endpoints")
+    console.print(f"  GET  /endpoints/:id       - Get endpoint")
+    console.print(f"  PATCH /endpoints/:id      - Update endpoint")
+    console.print(f"  DELETE /endpoints/:id     - Delete endpoint")
+    console.print(f"  POST /deliveries/send     - Send webhook")
+    console.print(f"  POST /deliveries/batch-send - Batch send")
+    console.print(f"  GET  /deliveries          - List deliveries")
+    console.print(f"  POST /dlq/batch-replay    - Batch replay DLQ")
+    console.print(f"  GET  /metrics (REST API)  - Service metrics")
+    console.print(f"  GET  /stats               - Store stats")
+
+    app = create_app(store_path=store_path)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

@@ -213,6 +213,17 @@ class WebhookStore:
             self._save()
         return True
 
+    def update_relay_rule(self, rule_id: str, **updates: Any) -> RelayRule | None:
+        with self._lock:
+            rule = self._data["relay_rules"].get(rule_id)
+            if rule is None:
+                return None
+            for key, value in updates.items():
+                if hasattr(rule, key):
+                    setattr(rule, key, value)
+            self._save()
+        return rule
+
     # --- Stats ---
 
     def get_stats(self, endpoint_id: str) -> dict[str, Any] | None:
@@ -230,6 +241,7 @@ class WebhookStore:
                 "pending": 0,
                 "retrying": 0,
                 "abandoned": 0,
+                "dead_letter": 0,
                 "avg_duration_ms": None,
                 "last_delivery_at": None,
                 "last_success_at": None,
@@ -266,6 +278,7 @@ class WebhookStore:
             "pending": status_counts.get(DeliveryStatus.PENDING, 0),
             "retrying": status_counts.get(DeliveryStatus.RETRYING, 0),
             "abandoned": status_counts.get(DeliveryStatus.ABANDONED, 0),
+            "dead_letter": status_counts.get(DeliveryStatus.DEAD_LETTER, 0),
             "avg_duration_ms": sum(durations) / len(durations) if durations else None,
             "last_delivery_at": last_delivery,
             "last_success_at": last_success,

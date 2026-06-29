@@ -1,4 +1,4 @@
-"""Webhook delivery engine — handles HTTP delivery with retries and HMAC signing."""
+"""Webhook delivery engine — handles HTTP delivery with retries, HMAC signing, transforms, rate limiting, and dead letter queue."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from .models import (
+    DeadLetterEntry,
     DeliveryAttempt,
     DeliveryStatus,
     RelayRule,
@@ -20,16 +21,46 @@ from .models import (
     WebhookEndpoint,
     WebhookStatus,
 )
+from .rate_limiter import RateLimiter
 from .store import WebhookStore
+from .transforms import TransformEngine
 
 
 class DeliveryEngine:
-    """Handles webhook delivery with retries, HMAC signing, and execution tracking."""
+    """Handles webhook delivery with retries, HMAC signing, transforms, rate limiting, and DLQ."""
 
     def __init__(self, store: WebhookStore, default_timeout: float = 30.0):
         self._store = store
         self._default_timeout = default_timeout
         self._client: httpx.AsyncClient | None = None
+        self._rate_limiter = RateLimiter()
+        self._transform_engine = TransformEngine()
+
+    def _record_metric(self, metric_type: str, **kwargs: Any) -> None:
+        """Record a metric event. Non-blocking — ignores errors."""
+        try:
+            from .metrics import get_metrics
+            m = get_metrics()
+            if metric_type == "delivery_success":
+                m.inc_delivery_success()
+                if kwargs.get("duration_ms"):
+                    m.observe_duration(kwargs["duration_ms"])
+            elif metric_type == "delivery_failed":
+                m.inc_delivery_failed()
+                if kwargs.get("duration_ms"):
+                    m.observe_duration(kwargs["duration_ms"])
+            elif metric_type == "delivery_abandoned":
+                m.inc_delivery_abandoned()
+            elif metric_type == "delivery_dead_letter":
+                m.inc_delivery_dead_letter()
+            elif metric_type == "delivery_retried":
+                m.inc_delivery_retried()
+            elif metric_type == "delivery_created":
+                m.inc_deliveries_created()
+            elif metric_type == "rate_limited":
+                m.inc_rate_limited()
+        except Exception:
+            pass
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -62,7 +93,7 @@ class DeliveryEngine:
         """Build headers for a webhook delivery."""
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "agent-webhook/0.2.0",
+            "User-Agent": "agent-webhook/0.4.0",
             "X-Webhook-ID": delivery.id,
             "X-Webhook-Event": delivery.event_type or "generic",
             "X-Webhook-Timestamp": datetime.now(timezone.utc).isoformat(),
@@ -75,6 +106,30 @@ class DeliveryEngine:
         # Add delivery-level headers (override endpoint-level)
         headers.update(delivery.payload_headers)
         return headers
+
+    def _apply_transforms(self, payload: dict[str, Any], endpoint: WebhookEndpoint) -> dict[str, Any]:
+        """Apply payload transforms configured for an endpoint."""
+        if not endpoint.transform_ids:
+            return payload
+
+        # Load transforms from store if available
+        transforms = []
+        if hasattr(self._store, "get_transform"):
+            for tid in endpoint.transform_ids:
+                t = self._store.get_transform(tid)
+                if t is not None:
+                    transforms.append(t)
+
+        if not transforms:
+            return payload
+
+        return self._transform_engine.apply(payload, transforms)
+
+    def _check_rate_limit(self, endpoint: WebhookEndpoint) -> bool:
+        """Check if the endpoint is within rate limits. Returns True if allowed."""
+        if endpoint.rate_limit is None:
+            return True
+        return self._rate_limiter.is_allowed(endpoint.id, endpoint.rate_limit)
 
     async def deliver(self, delivery: WebhookDelivery) -> DeliveryAttempt:
         """Execute a single delivery attempt."""
@@ -101,12 +156,31 @@ class DeliveryEngine:
             )
             return attempt
 
-        payload_str = json.dumps(delivery.payload, default=str)
+        # Check rate limit
+        if not self._check_rate_limit(endpoint):
+            self._record_metric("rate_limited")
+            attempt = DeliveryAttempt(
+                delivery_id=delivery.id,
+                attempt_number=delivery.current_attempt_number() + 1,
+                status=DeliveryStatus.FAILED,
+                error_message=f"Rate limit exceeded for endpoint '{endpoint.name}'",
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+            return attempt
+
+        # Apply transforms
+        transformed_payload = self._apply_transforms(delivery.payload, endpoint)
+        if transformed_payload != delivery.payload:
+            delivery.transformed_payload = transformed_payload
+            self._store.update_delivery(delivery.id, transformed_payload=transformed_payload)
+
+        payload_str = json.dumps(transformed_payload, default=str)
 
         # Generate HMAC signature if secret is configured
         signature = None
         if endpoint.secret:
-            signature = self.generate_hmac_signature(endpoint.secret, payload_str)
+            signature = self.generate_hmac_signature(endpoint.secret, payload_str, algorithm=endpoint.signing_algorithm.value)
 
         headers = self.build_headers(endpoint, delivery, signature)
 
@@ -160,6 +234,34 @@ class DeliveryEngine:
 
         return attempt
 
+    def _move_to_dead_letter(self, delivery: WebhookDelivery, endpoint: WebhookEndpoint, reason: str) -> None:
+        """Move a failed delivery to the dead letter queue."""
+        last_attempt = delivery.last_attempt()
+        entry = DeadLetterEntry(
+            delivery_id=delivery.id,
+            endpoint_id=delivery.endpoint_id,
+            payload=delivery.payload,
+            transformed_payload=delivery.transformed_payload,
+            event_type=delivery.event_type,
+            reason=reason,
+            last_status_code=last_attempt.response_status_code if last_attempt else None,
+            last_error=last_attempt.error_message if last_attempt else None,
+            total_attempts=delivery.current_attempt_number(),
+        )
+
+        if hasattr(self._store, "add_dead_letter"):
+            self._store.add_dead_letter(entry)
+
+        delivery.status = DeliveryStatus.DEAD_LETTER
+        delivery.dead_letter_reason = reason
+        delivery.dead_lettered_at = datetime.now(timezone.utc)
+        self._store.update_delivery(
+            delivery.id,
+            status=DeliveryStatus.DEAD_LETTER,
+            dead_letter_reason=reason,
+            dead_lettered_at=delivery.dead_lettered_at,
+        )
+
     async def process_delivery(self, delivery_id: str) -> WebhookDelivery | None:
         """Process a delivery: execute attempt and handle retry logic."""
         delivery = self._store.get_delivery(delivery_id)
@@ -174,17 +276,18 @@ class DeliveryEngine:
 
         # Execute attempt
         attempt = await self.deliver(delivery)
+        delivery.attempts.append(attempt)
         self._store.add_delivery_attempt(delivery.id, attempt)
 
         if attempt.status == DeliveryStatus.SUCCESS:
             delivery.status = DeliveryStatus.SUCCESS
             self._store.update_delivery(delivery.id, status=DeliveryStatus.SUCCESS)
+            self._record_metric("delivery_success", duration_ms=attempt.duration_ms or 0)
         else:
             # Check if we can retry
             retry_policy = endpoint.retry_policy
             if delivery.can_retry(retry_policy):
                 delay = retry_policy.delay_for_attempt(attempt.attempt_number)
-                next_retry = datetime.now(timezone.utc).timestamp() + delay
                 from datetime import timedelta
                 next_retry_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 delivery.status = DeliveryStatus.RETRYING
@@ -194,9 +297,14 @@ class DeliveryEngine:
                     status=DeliveryStatus.RETRYING,
                     next_retry_at=next_retry_dt,
                 )
+                self._record_metric("delivery_retried")
             else:
-                delivery.status = DeliveryStatus.ABANDONED
-                self._store.update_delivery(delivery.id, status=DeliveryStatus.ABANDONED)
+                # Move to dead letter queue instead of just abandoning
+                reason = f"Max retries ({retry_policy.max_retries}) exceeded"
+                if attempt.error_message:
+                    reason += f": {attempt.error_message}"
+                self._move_to_dead_letter(delivery, endpoint, reason)
+                self._record_metric("delivery_dead_letter")
 
         return self._store.get_delivery(delivery_id)
 

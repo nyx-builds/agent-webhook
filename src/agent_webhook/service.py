@@ -8,14 +8,19 @@ from typing import Any
 
 from .engine import DeliveryEngine
 from .models import (
+    DeadLetterEntry,
     DeliveryAttempt,
     DeliveryStatus,
     EventLogEntry,
     EventSubscription,
     Header,
     IncomingWebhook,
+    PayloadTransform,
+    RateLimit,
+    RateLimitPeriod,
     RelayRule,
     RetryPolicy,
+    TransformType,
     WebhookDelivery,
     WebhookEndpoint,
     WebhookMethod,
@@ -28,7 +33,13 @@ class WebhookService:
     """High-level service for webhook management."""
 
     def __init__(self, store: WebhookStore | None = None, store_path: str = "webhook_store.json"):
-        self._store = store or WebhookStore(store_path)
+        if store is not None:
+            self._store = store
+        elif store_path.endswith(".db"):
+            from .store_sqlite import SQLiteStore
+            self._store = SQLiteStore(store_path)
+        else:
+            self._store = WebhookStore(store_path)
         self._engine = DeliveryEngine(self._store)
 
     @property
@@ -52,9 +63,34 @@ class WebhookService:
         timeout_seconds: float = 30.0,
         description: str | None = None,
         max_retries: int = 3,
+        initial_delay_seconds: float = 1.0,
+        max_delay_seconds: float = 300.0,
+        backoff_multiplier: float = 2.0,
+        retry_on_status_codes: list[int] | None = None,
+        transform_ids: list[str] | None = None,
+        rate_limit: dict[str, Any] | None = None,
     ) -> WebhookEndpoint:
         """Create and register a new webhook endpoint."""
         header_objs = [Header(name=k, value=v) for k, v in (headers or {}).items()]
+
+        retry_policy_kwargs: dict[str, Any] = {
+            "max_retries": max_retries,
+            "initial_delay_seconds": initial_delay_seconds,
+            "max_delay_seconds": max_delay_seconds,
+            "backoff_multiplier": backoff_multiplier,
+        }
+        if retry_on_status_codes is not None:
+            retry_policy_kwargs["retry_on_status_codes"] = retry_on_status_codes
+        retry_policy = RetryPolicy(**retry_policy_kwargs)
+
+        rate_limit_obj = None
+        if rate_limit is not None:
+            rate_limit_obj = RateLimit(
+                max_requests=rate_limit["max_requests"],
+                period=RateLimitPeriod(rate_limit.get("period", "minute")),
+                burst=rate_limit.get("burst", 0),
+            )
+
         endpoint = WebhookEndpoint(
             name=name,
             url=url,
@@ -64,7 +100,9 @@ class WebhookService:
             secret=secret,
             timeout_seconds=timeout_seconds,
             description=description,
-            retry_policy=RetryPolicy(max_retries=max_retries),
+            retry_policy=retry_policy,
+            transform_ids=transform_ids or [],
+            rate_limit=rate_limit_obj,
         )
         return self._store.add_endpoint(endpoint)
 
@@ -79,6 +117,14 @@ class WebhookService:
         return self._store.list_endpoints(status=status, tag=tag)
 
     def update_endpoint(self, endpoint_id: str, **updates: Any) -> WebhookEndpoint | None:
+        # Handle rate_limit dict -> RateLimit model
+        if "rate_limit" in updates and isinstance(updates["rate_limit"], dict):
+            rl = updates.pop("rate_limit")
+            updates["rate_limit"] = RateLimit(
+                max_requests=rl["max_requests"],
+                period=RateLimitPeriod(rl.get("period", "minute")),
+                burst=rl.get("burst", 0),
+            )
         return self._store.update_endpoint(endpoint_id, **updates)
 
     def pause_endpoint(self, endpoint_id: str) -> WebhookEndpoint | None:
@@ -297,6 +343,12 @@ class WebhookService:
     def delete_relay_rule(self, rule_id: str) -> bool:
         return self._store.delete_relay_rule(rule_id)
 
+    def update_relay_rule(self, rule_id: str, **updates: Any) -> RelayRule | None:
+        """Update a relay rule. Only works with stores that support update_relay_rule."""
+        if not hasattr(self._store, "update_relay_rule"):
+            return None
+        return self._store.update_relay_rule(rule_id, **updates)
+
     def receive_incoming(
         self,
         path: str,
@@ -362,6 +414,143 @@ class WebhookService:
             endpoint_id=endpoint_id,
             limit=limit,
         )
+
+    # ── Transforms ───────────────────────────────────────────────────
+
+    def create_transform(
+        self,
+        name: str,
+        type: str,
+        config: dict[str, Any],
+    ) -> PayloadTransform | None:
+        """Create a new payload transform. Requires SQLite store."""
+        if not hasattr(self._store, "add_transform"):
+            return None
+        transform = PayloadTransform(
+            name=name,
+            type=TransformType(type),
+            config=config,
+        )
+        self._store.add_transform(transform)
+        return transform
+
+    def get_transform(self, transform_id: str) -> PayloadTransform | None:
+        """Get a transform by ID. Requires SQLite store."""
+        if not hasattr(self._store, "get_transform"):
+            return None
+        return self._store.get_transform(transform_id)
+
+    def list_transforms(self, type: str | None = None) -> list[PayloadTransform]:
+        """List all transforms. Requires SQLite store."""
+        if not hasattr(self._store, "list_transforms"):
+            return []
+        return self._store.list_transforms(type=type)
+
+    def update_transform(self, transform_id: str, **updates: Any) -> PayloadTransform | None:
+        """Update a transform. Requires SQLite store."""
+        if not hasattr(self._store, "update_transform"):
+            return None
+        return self._store.update_transform(transform_id, **updates)
+
+    def delete_transform(self, transform_id: str) -> bool:
+        """Delete a transform. Requires SQLite store."""
+        if not hasattr(self._store, "delete_transform"):
+            return False
+        return self._store.delete_transform(transform_id)
+
+    # ── Dead Letter Queue ────────────────────────────────────────────
+
+    def list_dead_letter(
+        self,
+        endpoint_id: str | None = None,
+        replayed: bool | None = None,
+        limit: int = 100,
+    ) -> list[DeadLetterEntry]:
+        """List dead letter queue entries. Requires SQLite store."""
+        if not hasattr(self._store, "list_dead_letter"):
+            return []
+        return self._store.list_dead_letter(endpoint_id=endpoint_id, replayed=replayed, limit=limit)
+
+    def get_dead_letter(self, entry_id: str) -> DeadLetterEntry | None:
+        """Get a dead letter entry by ID. Requires SQLite store."""
+        if not hasattr(self._store, "get_dead_letter"):
+            return None
+        return self._store.get_dead_letter(entry_id)
+
+    async def replay_dead_letter(self, entry_id: str) -> WebhookDelivery | None:
+        """Replay a dead letter entry by creating a new delivery. Requires SQLite store."""
+        if not hasattr(self._store, "get_dead_letter"):
+            return None
+        entry = self._store.get_dead_letter(entry_id)
+        if entry is None:
+            return None
+        if entry.replayed:
+            return None
+
+        # Create new delivery from the original payload
+        delivery = await self._engine.send(
+            endpoint_id=entry.endpoint_id,
+            payload=entry.payload,
+            event_type=entry.event_type,
+            metadata={"replayed_from_dlq": entry.id, "original_delivery_id": entry.delivery_id},
+        )
+
+        # Mark entry as replayed
+        self._store.update_dead_letter(
+            entry_id,
+            replayed=True,
+            replayed_delivery_id=delivery.id,
+            replayed_at=datetime.now(timezone.utc),
+        )
+
+        return delivery
+
+    def delete_dead_letter(self, entry_id: str) -> bool:
+        """Delete a dead letter entry. Requires SQLite store."""
+        if not hasattr(self._store, "delete_dead_letter"):
+            return False
+        return self._store.delete_dead_letter(entry_id)
+
+    async def batch_replay_dead_letter(
+        self,
+        endpoint_id: str | None = None,
+    ) -> list[WebhookDelivery]:
+        """Replay all unreplayed dead letter entries, optionally filtered by endpoint. Requires SQLite store."""
+        if not hasattr(self._store, "list_dead_letter"):
+            return []
+        entries = self._store.list_dead_letter(endpoint_id=endpoint_id, replayed=False, limit=1000)
+        results = []
+        for entry in entries:
+            try:
+                delivery = await self.replay_dead_letter(entry.id)
+                if delivery is not None:
+                    results.append(delivery)
+            except Exception:
+                pass  # Skip entries that fail to replay
+        return results
+
+    def dead_letter_count(self, endpoint_id: str | None = None) -> int:
+        """Get dead letter count. Requires SQLite store."""
+        if not hasattr(self._store, "dead_letter_count"):
+            return 0
+        return self._store.dead_letter_count(endpoint_id=endpoint_id)
+
+    # ── Rate Limiting ────────────────────────────────────────────────
+
+    def get_rate_limit_status(self, endpoint_id: str) -> dict[str, Any] | None:
+        """Get rate limit status for an endpoint."""
+        ep = self._store.get_endpoint(endpoint_id)
+        if ep is None or ep.rate_limit is None:
+            return None
+        return self._engine._rate_limiter.get_status(endpoint_id, ep.rate_limit)
+
+    # ── Migration ────────────────────────────────────────────────────
+
+    def migrate_from_json(self, json_path: str) -> dict[str, int] | None:
+        """Migrate from JSON store to SQLite store. Requires SQLite store."""
+        if not hasattr(self._store, "migrate_from_json"):
+            return None
+        return self._store.migrate_from_json(json_path)
 
     async def close(self) -> None:
         await self._engine.close()

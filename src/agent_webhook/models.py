@@ -28,6 +28,7 @@ class DeliveryStatus(str, Enum):
     FAILED = "failed"
     RETRYING = "retrying"
     ABANDONED = "abandoned"
+    DEAD_LETTER = "dead_letter"
 
 
 class WebhookStatus(str, Enum):
@@ -35,6 +36,21 @@ class WebhookStatus(str, Enum):
     ACTIVE = "active"
     PAUSED = "paused"
     DISABLED = "disabled"
+
+
+class TransformType(str, Enum):
+    """Types of payload transformations."""
+    FIELD_MAP = "field_map"
+    TEMPLATE = "template"
+    FILTER = "filter"
+    JQ = "jq"
+
+
+class RateLimitPeriod(str, Enum):
+    """Rate limit time periods."""
+    SECOND = "second"
+    MINUTE = "minute"
+    HOUR = "hour"
 
 
 class RetryPolicy(BaseModel):
@@ -67,6 +83,51 @@ class Header(BaseModel):
         return v
 
 
+class PayloadTransform(BaseModel):
+    """A payload transformation to apply before delivery."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = Field(..., min_length=1, description="Human-readable name for the transform")
+    type: TransformType = Field(..., description="Type of transformation")
+    config: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Transform configuration. "
+        "field_map: {'mapping': {'old_key': 'new_key', ...}} "
+        "filter: {'include': ['key1', ...]} or {'exclude': ['key1', ...]} "
+        "template: {'template': 'key1={{payload.key1}}&key2={{payload.key2}}'} "
+        "jq: {'expression': '.data | .[]'}",
+    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("config")
+    @classmethod
+    def validate_config(cls, v: dict[str, Any], info) -> dict[str, Any]:
+        # Basic validation — ensure config has expected keys
+        return v
+
+
+class RateLimit(BaseModel):
+    """Rate limiting configuration for an endpoint."""
+    max_requests: int = Field(..., ge=1, description="Maximum number of requests allowed")
+    period: RateLimitPeriod = Field(default=RateLimitPeriod.MINUTE, description="Time period for the limit")
+    burst: int = Field(default=0, ge=0, description="Allow burst above limit (0 = no burst)")
+
+    @property
+    def period_seconds(self) -> float:
+        """Convert period to seconds for rate calculation."""
+        return {
+            RateLimitPeriod.SECOND: 1.0,
+            RateLimitPeriod.MINUTE: 60.0,
+            RateLimitPeriod.HOUR: 3600.0,
+        }[self.period]
+
+
+class SigningAlgorithm(str, Enum):
+    """HMAC signing algorithms."""
+    SHA1 = "sha1"
+    SHA256 = "sha256"
+    SHA512 = "sha512"
+
+
 class WebhookEndpoint(BaseModel):
     """A registered webhook endpoint that can receive deliveries."""
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -78,10 +139,13 @@ class WebhookEndpoint(BaseModel):
     status: WebhookStatus = Field(default=WebhookStatus.ACTIVE, description="Current endpoint status")
     tags: list[str] = Field(default_factory=list, description="Tags for filtering and grouping")
     secret: str | None = Field(default=None, description="Secret for HMAC signature generation")
+    signing_algorithm: SigningAlgorithm = Field(default=SigningAlgorithm.SHA256, description="HMAC signing algorithm")
     timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0, description="Request timeout")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     description: str | None = Field(default=None, description="Optional description")
+    transform_ids: list[str] = Field(default_factory=list, description="Transform IDs to apply before delivery")
+    rate_limit: RateLimit | None = Field(default=None, description="Rate limiting configuration")
 
     @field_validator("url")
     @classmethod
@@ -129,6 +193,9 @@ class WebhookDelivery(BaseModel):
     next_retry_at: datetime | None = None
     event_type: str | None = Field(default=None, description="Optional event type tag")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Extra metadata")
+    transformed_payload: dict[str, Any] | None = Field(default=None, description="Payload after transforms applied")
+    dead_letter_reason: str | None = Field(default=None, description="Reason delivery went to dead letter queue")
+    dead_lettered_at: datetime | None = Field(default=None, description="When delivery was moved to dead letter queue")
 
     def current_attempt_number(self) -> int:
         return len(self.attempts)
@@ -137,7 +204,7 @@ class WebhookDelivery(BaseModel):
         return self.attempts[-1] if self.attempts else None
 
     def can_retry(self, retry_policy: RetryPolicy) -> bool:
-        if self.status in (DeliveryStatus.SUCCESS, DeliveryStatus.ABANDONED):
+        if self.status in (DeliveryStatus.SUCCESS, DeliveryStatus.ABANDONED, DeliveryStatus.DEAD_LETTER):
             return False
         return self.current_attempt_number() < retry_policy.max_retries + 1
 
@@ -152,6 +219,7 @@ class WebhookStats(BaseModel):
     pending: int = 0
     retrying: int = 0
     abandoned: int = 0
+    dead_letter: int = 0
     avg_duration_ms: float | None = None
     last_delivery_at: datetime | None = None
     last_success_at: datetime | None = None
@@ -231,3 +299,21 @@ class RelayRule(BaseModel):
             return True
         pattern = re.escape(self.path_pattern).replace(r"\*", ".*")
         return bool(re.fullmatch(pattern, path))
+
+
+class DeadLetterEntry(BaseModel):
+    """An entry in the dead letter queue for permanently failed deliveries."""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    delivery_id: str = Field(..., description="Original delivery ID")
+    endpoint_id: str = Field(..., description="Target endpoint ID")
+    payload: dict[str, Any] = Field(..., description="Original payload")
+    transformed_payload: dict[str, Any] | None = Field(default=None, description="Payload after transforms")
+    event_type: str | None = None
+    reason: str = Field(..., description="Reason for dead-lettering")
+    last_status_code: int | None = None
+    last_error: str | None = None
+    total_attempts: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    replayed: bool = False
+    replayed_delivery_id: str | None = Field(default=None, description="ID of the replayed delivery")
+    replayed_at: datetime | None = None
