@@ -121,6 +121,22 @@ class BatchReplayDLQRequest(PydanticModel):
     endpoint_id: str | None = None
 
 
+class VerifySignatureRequest(PydanticModel):
+    raw_body: str
+    headers: dict[str, str]
+    secret: str
+    provider: str = Field(default="generic")
+    algorithm: str = Field(default="sha256")
+    tolerance_seconds: int = Field(default=300)
+
+
+class GenerateSignatureRequest(PydanticModel):
+    raw_body: str
+    secret: str
+    provider: str = Field(default="generic")
+    algorithm: str = Field(default="sha256")
+
+
 # ── App Factory ────────────────────────────────────────────────────
 
 
@@ -137,7 +153,7 @@ def create_app(store_path: str = "webhook_store.db") -> FastAPI:
     app = FastAPI(
         title="Agent Webhook",
         description="Webhook management, delivery, and relay REST API for autonomous agents",
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan,
     )
 
@@ -153,7 +169,7 @@ def create_app(store_path: str = "webhook_store.db") -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "version": "0.4.0", "timestamp": datetime.now(timezone.utc).isoformat()}
+        return {"status": "ok", "version": "0.5.0", "timestamp": datetime.now(timezone.utc).isoformat()}
 
     # ── Endpoints ────────────────────────────────────────────────
 
@@ -536,5 +552,142 @@ def create_app(store_path: str = "webhook_store.db") -> FastAPI:
         from fastapi.responses import PlainTextResponse
         m = get_metrics()
         return PlainTextResponse(content=m.generate_prometheus(), media_type="text/plain")
+
+    # ── Circuit Breaker ────────────────────────────────────────────
+
+    @app.get("/circuit-breakers")
+    async def list_circuit_breakers():
+        """Get circuit breaker states for all endpoints with active breakers."""
+        states = service.get_all_circuit_breaker_states()
+        return {"breakers": states, "count": len(states)}
+
+    @app.get("/circuit-breakers/{endpoint_id}")
+    async def get_circuit_breaker(endpoint_id: str):
+        """Get circuit breaker state for a specific endpoint."""
+        state = service.get_circuit_breaker_state(endpoint_id)
+        if state is None:
+            return {
+                "endpoint_id": endpoint_id,
+                "state": "closed",
+                "message": "No circuit breaker tracked yet",
+            }
+        return state
+
+    @app.post("/circuit-breakers/{endpoint_id}/reset")
+    async def reset_circuit_breaker(endpoint_id: str):
+        """Reset (force close) the circuit breaker for an endpoint."""
+        result = service.reset_circuit_breaker(endpoint_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="No circuit breaker found for endpoint")
+        return {"message": "Circuit breaker reset", **result}
+
+    # ── Signature Verification ─────────────────────────────────────
+
+    @app.post("/verify-signature")
+    async def verify_signature(req: VerifySignatureRequest):
+        """Verify an incoming webhook HMAC signature."""
+        result = service.verify_incoming_signature(
+            raw_body=req.raw_body,
+            headers=req.headers,
+            secret=req.secret,
+            provider=req.provider,
+            algorithm=req.algorithm,
+            tolerance_seconds=req.tolerance_seconds,
+        )
+        return result
+
+    @app.post("/generate-signature")
+    async def generate_signature(req: GenerateSignatureRequest):
+        """Generate a test HMAC signature for a payload."""
+        from .signature import SignatureVerifier
+        verifier = SignatureVerifier()
+        sig = verifier.generate_signature(
+            raw_body=req.raw_body,
+            secret=req.secret,
+            algorithm=req.algorithm,
+            provider=req.provider,
+        )
+        return {"signature": sig, "provider": req.provider}
+
+    @app.post("/detect-provider")
+    async def detect_provider(headers: dict[str, str]):
+        """Auto-detect webhook provider from request headers."""
+        provider = service.detect_incoming_provider(headers)
+        return {"detected_provider": provider}
+
+    # ── Relay Rule Filters ──────────────────────────────────────────
+
+    @app.put("/relay-rules/{rule_id}/filter")
+    async def set_relay_filter(rule_id: str, filter_rules: dict):
+        """Set filter rules on a relay rule for conditional forwarding."""
+        from .filters import validate_filter_rules
+        errors = validate_filter_rules(filter_rules)
+        if errors:
+            raise HTTPException(status_code=422, detail={"valid": False, "errors": errors})
+        if not hasattr(service.store, "update_relay_rule"):
+            raise HTTPException(status_code=400, detail="Store does not support relay rule updates")
+        rule = service.store.update_relay_rule(rule_id, filter_rules=filter_rules)
+        if rule is None:
+            raise HTTPException(status_code=404, detail="Relay rule not found")
+        return {
+            "message": "Filter rules set successfully",
+            "rule_id": rule_id,
+            "filter_rules": rule.filter_rules,
+        }
+
+    @app.delete("/relay-rules/{rule_id}/filter")
+    async def clear_relay_filter(rule_id: str):
+        """Clear filter rules from a relay rule."""
+        if not hasattr(service.store, "update_relay_rule"):
+            raise HTTPException(status_code=400, detail="Store does not support relay rule updates")
+        rule = service.store.update_relay_rule(rule_id, filter_rules=None)
+        if rule is None:
+            raise HTTPException(status_code=404, detail="Relay rule not found")
+        return {"message": "Filter rules cleared", "rule_id": rule_id}
+
+    @app.post("/relay-rules/validate-filter")
+    async def validate_filter(filter_rules: dict):
+        """Validate filter rules without applying them."""
+        from .filters import validate_filter_rules
+        errors = validate_filter_rules(filter_rules)
+        result = {"valid": len(errors) == 0}
+        if errors:
+            result["errors"] = errors
+        return result
+
+    # ── Import/Export ───────────────────────────────────────────────
+
+    @app.get("/export")
+    async def export_config(
+        endpoints: bool = True,
+        relay_rules: bool = True,
+        transforms: bool = True,
+        subscriptions: bool = True,
+    ):
+        """Export all configuration to a portable format."""
+        from .import_export import export_config as _export
+        return _export(
+            service.store,
+            include_endpoints=endpoints,
+            include_relay_rules=relay_rules,
+            include_transforms=transforms,
+            include_subscriptions=subscriptions,
+        )
+
+    @app.post("/import")
+    async def import_config(
+        data: dict,
+        conflict_strategy: str = "skip",
+        restore_secrets: bool = False,
+    ):
+        """Import configuration from an export format."""
+        from .import_export import import_config as _import
+        summary = _import(
+            service.store,
+            data,
+            conflict_strategy=conflict_strategy,
+            restore_secrets=restore_secrets,
+        )
+        return summary
 
     return app

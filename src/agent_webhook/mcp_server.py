@@ -498,6 +498,129 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     },
                 },
             ),
+            # ── v0.5.0 New Tools ──────────────────────────────────
+            Tool(
+                name="circuit_breaker_state",
+                description="Get circuit breaker state for an endpoint (closed, open, half_open)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="circuit_breaker_all",
+                description="Get circuit breaker states for all endpoints with active breakers",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="circuit_breaker_reset",
+                description="Reset (force close) the circuit breaker for an endpoint",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="verify_signature",
+                description="Verify an incoming webhook HMAC signature. Supports generic, github, stripe, slack, shopify providers.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "raw_body": {"type": "string", "description": "Raw request body (the exact bytes received)"},
+                        "headers": {"type": "object", "description": "Request headers"},
+                        "secret": {"type": "string", "description": "Shared secret for HMAC verification"},
+                        "provider": {"type": "string", "enum": ["generic", "github", "stripe", "slack", "shopify"], "default": "generic"},
+                        "algorithm": {"type": "string", "enum": ["sha256", "sha1"], "default": "sha256", "description": "Algorithm for generic provider"},
+                        "tolerance_seconds": {"type": "integer", "default": 300, "description": "Max timestamp age for replay prevention"},
+                    },
+                    "required": ["raw_body", "headers", "secret"],
+                },
+            ),
+            Tool(
+                name="detect_provider",
+                description="Auto-detect the webhook provider from request headers",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "headers": {"type": "object", "description": "Request headers"},
+                    },
+                    "required": ["headers"],
+                },
+            ),
+            Tool(
+                name="generate_signature",
+                description="Generate a test HMAC signature for a payload (useful for testing relay verification)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "raw_body": {"type": "string", "description": "Raw body to sign"},
+                        "secret": {"type": "string", "description": "HMAC secret"},
+                        "provider": {"type": "string", "enum": ["generic", "github", "stripe", "slack", "shopify"], "default": "generic"},
+                        "algorithm": {"type": "string", "enum": ["sha256", "sha1"], "default": "sha256"},
+                    },
+                    "required": ["raw_body", "secret"],
+                },
+            ),
+            # ── v0.5.0: Relay Rule Filters ────────────────────────
+            Tool(
+                name="relay_set_filter",
+                description="Set filter rules on a relay rule. Filters allow conditional forwarding based on headers and payload fields. Operators: equals, not_equals, contains, starts_with, ends_with, regex, exists, not_exists (string); eq, ne, gt, gte, lt, lte (numeric); in, not_in (list). Logic: all (AND), any (OR), none (NOT any).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "rule_id": {"type": "string", "description": "Relay rule ID"},
+                        "filter_rules": {
+                            "type": "object",
+                            "description": "Filter configuration: {logic: 'all'|'any'|'none', conditions: [{type: 'header'|'payload', field: 'X', operator: 'equals', value: 'Y'}]}",
+                        },
+                    },
+                    "required": ["rule_id"],
+                },
+            ),
+            Tool(
+                name="relay_validate_filter",
+                description="Validate relay rule filter rules. Returns any validation errors.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "filter_rules": {"type": "object", "description": "Filter configuration to validate"},
+                    },
+                    "required": ["filter_rules"],
+                },
+            ),
+            # ── v0.5.0: Import/Export ──────────────────────────────
+            Tool(
+                name="export_config",
+                description="Export all configuration (endpoints, relay rules, transforms, subscriptions) to a portable format. Secrets are excluded by default.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "include_endpoints": {"type": "boolean", "default": True},
+                        "include_relay_rules": {"type": "boolean", "default": True},
+                        "include_transforms": {"type": "boolean", "default": True},
+                        "include_subscriptions": {"type": "boolean", "default": True},
+                    },
+                },
+            ),
+            Tool(
+                name="import_config",
+                description="Import configuration from a previously exported format. Supports conflict strategies: skip (default), overwrite, rename.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "data": {"type": "object", "description": "Export data to import"},
+                        "conflict_strategy": {"type": "string", "enum": ["skip", "overwrite", "rename"], "default": "skip"},
+                        "restore_secrets": {"type": "boolean", "default": False, "description": "Restore HMAC secrets from export (default false for security)"},
+                    },
+                    "required": ["data"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -986,6 +1109,113 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                 else:
                     data = m.get_json()
                     return [TextContent(type="text", text=json.dumps(data, default=str, indent=2))]
+
+            # ── v0.5.0 New Tool Handlers ─────────────────────────────
+
+            elif name == "circuit_breaker_state":
+                state = engine.get_circuit_breaker_state(arguments["endpoint_id"])
+                if state is None:
+                    return [TextContent(type="text", text=json.dumps({"endpoint_id": arguments["endpoint_id"], "state": "closed", "message": "No circuit breaker tracked yet (all endpoints start in closed state)"}))]
+                return [TextContent(type="text", text=json.dumps(state, default=str, indent=2))]
+
+            elif name == "circuit_breaker_all":
+                states = engine.get_all_circuit_breaker_states()
+                if not states:
+                    return [TextContent(type="text", text=json.dumps({"message": "No circuit breakers tracked", "breakers": []}))]
+                return [TextContent(type="text", text=json.dumps(states, default=str, indent=2))]
+
+            elif name == "circuit_breaker_reset":
+                result = engine.reset_circuit_breaker(arguments["endpoint_id"])
+                if result is None:
+                    return [TextContent(type="text", text=f"No circuit breaker found for endpoint: {arguments['endpoint_id']}")]
+                return [TextContent(type="text", text=json.dumps({"message": "Circuit breaker reset", **result}, default=str, indent=2))]
+
+            elif name == "verify_signature":
+                from .signature import SignatureVerifier, SignatureError
+                verifier = SignatureVerifier(tolerance_seconds=arguments.get("tolerance_seconds", 300))
+                try:
+                    verifier.verify_or_raise(
+                        raw_body=arguments["raw_body"],
+                        headers=arguments["headers"],
+                        secret=arguments["secret"],
+                        provider=arguments.get("provider", "generic"),
+                        algorithm=arguments.get("algorithm", "sha256"),
+                    )
+                    return [TextContent(type="text", text=json.dumps({"valid": True, "provider": arguments.get("provider", "generic")}, indent=2))]
+                except SignatureError as e:
+                    return [TextContent(type="text", text=json.dumps({"valid": False, "provider": arguments.get("provider", "generic"), "error": str(e)}, indent=2))]
+
+            elif name == "detect_provider":
+                from .signature import SignatureVerifier
+                verifier = SignatureVerifier()
+                provider = verifier.detect_provider(arguments["headers"])
+                return [TextContent(type="text", text=json.dumps({"detected_provider": provider}, indent=2))]
+
+            elif name == "generate_signature":
+                from .signature import SignatureVerifier
+                verifier = SignatureVerifier()
+                sig = verifier.generate_signature(
+                    raw_body=arguments["raw_body"],
+                    secret=arguments["secret"],
+                    algorithm=arguments.get("algorithm", "sha256"),
+                    provider=arguments.get("provider", "generic"),
+                )
+                return [TextContent(type="text", text=json.dumps({"signature": sig, "provider": arguments.get("provider", "generic")}, indent=2))]
+
+            # ── v0.5.0: Relay Rule Filters ─────────────────────────
+
+            elif name == "relay_set_filter":
+                from .filters import validate_filter_rules
+                rule_id = arguments["rule_id"]
+                filter_rules = arguments.get("filter_rules", {})
+
+                # Validate first
+                errors = validate_filter_rules(filter_rules)
+                if errors:
+                    return [TextContent(type="text", text=json.dumps({"valid": False, "errors": errors}, indent=2))]
+
+                if hasattr(store, "update_relay_rule"):
+                    rule = store.update_relay_rule(rule_id, filter_rules=filter_rules)
+                else:
+                    return [TextContent(type="text", text="Relay rule updates not supported by this store")]
+                if rule is None:
+                    return [TextContent(type="text", text=f"Relay rule not found: {rule_id}")]
+                return [TextContent(type="text", text=json.dumps({
+                    "message": "Filter rules set successfully",
+                    "rule_id": rule_id,
+                    "filter_rules": rule.filter_rules,
+                }, default=str, indent=2))]
+
+            elif name == "relay_validate_filter":
+                from .filters import validate_filter_rules
+                errors = validate_filter_rules(arguments["filter_rules"])
+                result = {"valid": len(errors) == 0}
+                if errors:
+                    result["errors"] = errors
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            # ── v0.5.0: Import/Export ──────────────────────────────
+
+            elif name == "export_config":
+                from .import_export import export_config
+                data = export_config(
+                    store,
+                    include_endpoints=arguments.get("include_endpoints", True),
+                    include_relay_rules=arguments.get("include_relay_rules", True),
+                    include_transforms=arguments.get("include_transforms", True),
+                    include_subscriptions=arguments.get("include_subscriptions", True),
+                )
+                return [TextContent(type="text", text=json.dumps(data, default=str, indent=2))]
+
+            elif name == "import_config":
+                from .import_export import import_config
+                summary = import_config(
+                    store,
+                    arguments["data"],
+                    conflict_strategy=arguments.get("conflict_strategy", "skip"),
+                    restore_secrets=arguments.get("restore_secrets", False),
+                )
+                return [TextContent(type="text", text=json.dumps(summary, default=str, indent=2))]
 
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]

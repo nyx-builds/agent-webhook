@@ -24,10 +24,11 @@ from .models import (
 from .rate_limiter import RateLimiter
 from .store import WebhookStore
 from .transforms import TransformEngine
+from .circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState
 
 
 class DeliveryEngine:
-    """Handles webhook delivery with retries, HMAC signing, transforms, rate limiting, and DLQ."""
+    """Handles webhook delivery with retries, HMAC signing, transforms, rate limiting, circuit breaker, and DLQ."""
 
     def __init__(self, store: WebhookStore, default_timeout: float = 30.0):
         self._store = store
@@ -35,6 +36,7 @@ class DeliveryEngine:
         self._client: httpx.AsyncClient | None = None
         self._rate_limiter = RateLimiter()
         self._transform_engine = TransformEngine()
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
 
     def _record_metric(self, metric_type: str, **kwargs: Any) -> None:
         """Record a metric event. Non-blocking — ignores errors."""
@@ -93,7 +95,7 @@ class DeliveryEngine:
         """Build headers for a webhook delivery."""
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "agent-webhook/0.4.0",
+            "User-Agent": "agent-webhook/0.5.0",
             "X-Webhook-ID": delivery.id,
             "X-Webhook-Event": delivery.event_type or "generic",
             "X-Webhook-Timestamp": datetime.now(timezone.utc).isoformat(),
@@ -131,6 +133,41 @@ class DeliveryEngine:
             return True
         return self._rate_limiter.is_allowed(endpoint.id, endpoint.rate_limit)
 
+    def _get_circuit_breaker(self, endpoint: WebhookEndpoint) -> CircuitBreaker:
+        """Get or create a circuit breaker for an endpoint."""
+        if endpoint.id not in self._circuit_breakers:
+            config = CircuitBreakerConfig()
+            if endpoint.circuit_breaker_config:
+                config = CircuitBreakerConfig.from_dict(endpoint.circuit_breaker_config)
+            self._circuit_breakers[endpoint.id] = CircuitBreaker(config)
+        return self._circuit_breakers[endpoint.id]
+
+    def _check_circuit_breaker(self, endpoint: WebhookEndpoint) -> bool:
+        """Check if the circuit breaker allows a delivery. Returns True if allowed."""
+        if not endpoint.circuit_breaker_enabled:
+            return True
+        breaker = self._get_circuit_breaker(endpoint)
+        return breaker.is_allowed(endpoint.id)
+
+    def get_circuit_breaker_state(self, endpoint_id: str) -> dict[str, Any] | None:
+        """Get circuit breaker state for an endpoint."""
+        if endpoint_id not in self._circuit_breakers:
+            return None
+        return self._circuit_breakers[endpoint_id].get_state(endpoint_id)
+
+    def get_all_circuit_breaker_states(self) -> list[dict[str, Any]]:
+        """Get circuit breaker states for all endpoints with breakers."""
+        results = []
+        for eid, breaker in self._circuit_breakers.items():
+            results.append(breaker.get_state(eid))
+        return results
+
+    def reset_circuit_breaker(self, endpoint_id: str) -> dict[str, Any] | None:
+        """Reset (force close) the circuit breaker for an endpoint."""
+        if endpoint_id not in self._circuit_breakers:
+            return None
+        return self._circuit_breakers[endpoint_id].reset(endpoint_id)
+
     async def deliver(self, delivery: WebhookDelivery) -> DeliveryAttempt:
         """Execute a single delivery attempt."""
         endpoint = self._store.get_endpoint(delivery.endpoint_id)
@@ -151,6 +188,19 @@ class DeliveryEngine:
                 attempt_number=delivery.current_attempt_number() + 1,
                 status=DeliveryStatus.FAILED,
                 error_message=f"Endpoint '{endpoint.name}' is {endpoint.status.value}",
+                started_at=datetime.now(timezone.utc),
+                completed_at=datetime.now(timezone.utc),
+            )
+            return attempt
+
+        # Check circuit breaker
+        if not self._check_circuit_breaker(endpoint):
+            cb_state = self._get_circuit_breaker(endpoint).get_state(endpoint.id)
+            attempt = DeliveryAttempt(
+                delivery_id=delivery.id,
+                attempt_number=delivery.current_attempt_number() + 1,
+                status=DeliveryStatus.FAILED,
+                error_message=f"Circuit breaker open for endpoint '{endpoint.name}' (state: {cb_state['state']})",
                 started_at=datetime.now(timezone.utc),
                 completed_at=datetime.now(timezone.utc),
             )
@@ -283,7 +333,15 @@ class DeliveryEngine:
             delivery.status = DeliveryStatus.SUCCESS
             self._store.update_delivery(delivery.id, status=DeliveryStatus.SUCCESS)
             self._record_metric("delivery_success", duration_ms=attempt.duration_ms or 0)
+            # Record success to circuit breaker
+            if endpoint.circuit_breaker_enabled:
+                breaker = self._get_circuit_breaker(endpoint)
+                breaker.record_success(endpoint.id)
         else:
+            # Record failure to circuit breaker
+            if endpoint.circuit_breaker_enabled:
+                breaker = self._get_circuit_breaker(endpoint)
+                breaker.record_failure(endpoint.id)
             # Check if we can retry
             retry_policy = endpoint.retry_policy
             if delivery.can_retry(retry_policy):
@@ -346,9 +404,21 @@ class DeliveryEngine:
         body: dict[str, Any] | str | None,
         query_params: dict[str, str] | None = None,
         source_ip: str | None = None,
+        raw_body: bytes | str | None = None,
     ) -> list[str]:
-        """Apply relay rules to an incoming webhook and create deliveries."""
+        """Apply relay rules to an incoming webhook and create deliveries.
+
+        If a relay rule has verify_signature=True, the incoming webhook's
+        HMAC signature is verified before forwarding. If verification fails,
+        the webhook is not forwarded.
+
+        Args:
+            raw_body: The raw request body bytes (before JSON parsing).
+                Required for signature verification. If not provided and
+                verification is needed, body will be JSON-serialized.
+        """
         from .models import IncomingWebhook
+        from .signature import SignatureVerifier, SignatureError
 
         # Record incoming webhook
         incoming = IncomingWebhook(
@@ -374,6 +444,36 @@ class DeliveryEngine:
         payload = body if isinstance(body, dict) else {"raw_body": body}
 
         for rule in matching_rules:
+            # Verify signature if configured
+            if rule.verify_signature and rule.verify_secret:
+                verifier = SignatureVerifier(tolerance_seconds=rule.verify_tolerance_seconds)
+
+                # Use raw_body if provided, otherwise serialize body
+                sig_body = raw_body
+                if sig_body is None:
+                    import json as _json
+                    sig_body = _json.dumps(body) if body is not None else ""
+
+                try:
+                    verifier.verify_or_raise(
+                        raw_body=sig_body,
+                        headers=headers,
+                        secret=rule.verify_secret,
+                        provider=rule.verify_provider,
+                        algorithm=rule.verify_algorithm,
+                    )
+                except SignatureError:
+                    # Signature verification failed — skip this rule
+                    incoming.tags.append(f"sig_verification_failed:{rule.id}")
+                    continue
+
+            # Apply filter rules if configured
+            if rule.filter_rules:
+                from .filters import evaluate_filter
+                if not evaluate_filter(rule.filter_rules, headers, payload):
+                    incoming.tags.append(f"filter_rejected:{rule.id}")
+                    continue
+
             for endpoint_id in rule.target_endpoint_ids:
                 endpoint = self._store.get_endpoint(endpoint_id)
                 if endpoint is None or not endpoint.is_active():

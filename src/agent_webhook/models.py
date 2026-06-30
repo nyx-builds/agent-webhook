@@ -146,6 +146,11 @@ class WebhookEndpoint(BaseModel):
     description: str | None = Field(default=None, description="Optional description")
     transform_ids: list[str] = Field(default_factory=list, description="Transform IDs to apply before delivery")
     rate_limit: RateLimit | None = Field(default=None, description="Rate limiting configuration")
+    circuit_breaker_enabled: bool = Field(default=True, description="Enable circuit breaker for this endpoint")
+    circuit_breaker_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Circuit breaker config: {failure_threshold, recovery_timeout, half_open_max_calls, success_threshold}",
+    )
 
     @field_validator("url")
     @classmethod
@@ -285,6 +290,11 @@ class RelayRule(BaseModel):
     filter_rules: dict[str, Any] | None = Field(default=None, description="Optional filter rules for incoming webhooks")
     tags: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    verify_signature: bool = Field(default=False, description="Verify incoming webhook HMAC signatures")
+    verify_secret: str | None = Field(default=None, description="Secret for incoming signature verification")
+    verify_provider: str = Field(default="generic", description="Signature provider: generic, github, stripe, slack, shopify")
+    verify_algorithm: str = Field(default="sha256", description="HMAC algorithm for generic verification (sha256/sha1)")
+    verify_tolerance_seconds: int = Field(default=300, description="Max age for timestamps to prevent replay attacks")
 
     @field_validator("path_pattern")
     @classmethod

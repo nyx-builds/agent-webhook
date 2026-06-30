@@ -357,8 +357,13 @@ class WebhookService:
         body: dict[str, Any] | str | None = None,
         query_params: dict[str, str] | None = None,
         source_ip: str | None = None,
+        raw_body: bytes | str | None = None,
     ) -> list[str]:
-        """Receive an incoming webhook and apply relay rules. Returns delivery IDs."""
+        """Receive an incoming webhook and apply relay rules. Returns delivery IDs.
+
+        Args:
+            raw_body: Raw request body for signature verification.
+        """
         return self._engine.apply_relay_rules(
             path=path,
             method=method,
@@ -366,6 +371,7 @@ class WebhookService:
             body=body,
             query_params=query_params,
             source_ip=source_ip,
+            raw_body=raw_body,
         )
 
     def list_incoming(
@@ -551,6 +557,56 @@ class WebhookService:
         if not hasattr(self._store, "migrate_from_json"):
             return None
         return self._store.migrate_from_json(json_path)
+
+    # ── Circuit Breaker ──────────────────────────────────────────────
+
+    def get_circuit_breaker_state(self, endpoint_id: str) -> dict[str, Any] | None:
+        """Get circuit breaker state for an endpoint."""
+        return self._engine.get_circuit_breaker_state(endpoint_id)
+
+    def get_all_circuit_breaker_states(self) -> list[dict[str, Any]]:
+        """Get circuit breaker states for all endpoints with breakers."""
+        return self._engine.get_all_circuit_breaker_states()
+
+    def reset_circuit_breaker(self, endpoint_id: str) -> dict[str, Any] | None:
+        """Reset (force close) the circuit breaker for an endpoint."""
+        return self._engine.reset_circuit_breaker(endpoint_id)
+
+    # ── Incoming Webhook Verification ────────────────────────────────
+
+    def verify_incoming_signature(
+        self,
+        raw_body: bytes | str,
+        headers: dict[str, str],
+        secret: str,
+        provider: str = "generic",
+        algorithm: str = "sha256",
+        tolerance_seconds: int = 300,
+    ) -> dict[str, Any]:
+        """Verify an incoming webhook signature.
+
+        Returns a dict with 'valid': bool and 'provider' / 'error' fields.
+        """
+        from .signature import SignatureVerifier, SignatureError
+
+        verifier = SignatureVerifier(tolerance_seconds=tolerance_seconds)
+        try:
+            verifier.verify_or_raise(
+                raw_body=raw_body,
+                headers=headers,
+                secret=secret,
+                provider=provider,
+                algorithm=algorithm,
+            )
+            return {"valid": True, "provider": provider}
+        except SignatureError as e:
+            return {"valid": False, "provider": provider, "error": str(e)}
+
+    def detect_incoming_provider(self, headers: dict[str, str]) -> str | None:
+        """Auto-detect the webhook provider from request headers."""
+        from .signature import SignatureVerifier
+        verifier = SignatureVerifier()
+        return verifier.detect_provider(headers)
 
     async def close(self) -> None:
         await self._engine.close()

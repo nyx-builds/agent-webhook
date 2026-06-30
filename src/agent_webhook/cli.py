@@ -1250,6 +1250,330 @@ def rate_limit_status_cmd(ctx: click.Context, endpoint_id: str) -> None:
         console.print(f"  Resets at:  {status['reset_at']:.1f}s from now")
 
 
+@cli.group()
+def circuit_breaker() -> None:
+    """Manage circuit breakers for endpoints."""
+    pass
+
+
+@circuit_breaker.command("show")
+@click.argument("endpoint_id")
+@click.pass_context
+def circuit_breaker_show(ctx: click.Context, endpoint_id: str) -> None:
+    """Show circuit breaker state for an endpoint."""
+    store = get_store(ctx.obj["store_path"])
+    from .engine import DeliveryEngine
+    engine = DeliveryEngine(store)
+    state = engine.get_circuit_breaker_state(endpoint_id)
+
+    if state is None:
+        console.print(f"[yellow]No circuit breaker tracked yet for endpoint {endpoint_id} (starts in closed state)[/yellow]")
+        return
+
+    state_style = {"closed": "green", "open": "red", "half_open": "yellow"}.get(state["state"], "")
+    console.print(f"\n[bold]Circuit Breaker: {endpoint_id[:12]}...[/bold]")
+    console.print(f"  State:               [{state_style}]{state['state']}[/{state_style}]")
+    console.print(f"  Consecutive Failures: {state['consecutive_failures']}")
+    console.print(f"  Consecutive Successes: {state['consecutive_successes']}")
+    console.print(f"  Total Trips:          {state['total_trips']}")
+    if state.get("time_until_half_open_seconds") is not None:
+        console.print(f"  Time Until Half-Open: {state['time_until_half_open_seconds']}s")
+    console.print(f"  Last Failure:         {format_dt(state['last_failure_at'])}")
+    console.print(f"  Last Success:         {format_dt(state['last_success_at'])}")
+    config = state.get("config", {})
+    console.print(f"  Config:")
+    console.print(f"    Failure Threshold:    {config.get('failure_threshold', 5)}")
+    console.print(f"    Recovery Timeout:     {config.get('recovery_timeout', 60.0)}s")
+    console.print(f"    Half-Open Max Calls:  {config.get('half_open_max_calls', 3)}")
+    console.print(f"    Success Threshold:    {config.get('success_threshold', 2)}")
+
+
+@circuit_breaker.command("list")
+@click.pass_context
+def circuit_breaker_list(ctx: click.Context) -> None:
+    """List all circuit breaker states."""
+    store = get_store(ctx.obj["store_path"])
+    from .engine import DeliveryEngine
+    engine = DeliveryEngine(store)
+    states = engine.get_all_circuit_breaker_states()
+
+    if not states:
+        console.print("[yellow]No circuit breakers tracked.[/yellow]")
+        return
+
+    table = Table(title="Circuit Breakers")
+    table.add_column("Endpoint ID", style="dim", max_width=14)
+    table.add_column("State")
+    table.add_column("Failures")
+    table.add_column("Trips")
+    table.add_column("Last Failure")
+
+    for s in states:
+        state_style = {"closed": "green", "open": "red", "half_open": "yellow"}.get(s["state"], "")
+        table.add_row(
+            s["endpoint_id"][:12],
+            f"[{state_style}]{s['state']}[/{state_style}]",
+            str(s["consecutive_failures"]),
+            str(s["total_trips"]),
+            format_dt(s["last_failure_at"]),
+        )
+
+    console.print(table)
+
+
+@circuit_breaker.command("reset")
+@click.argument("endpoint_id")
+@click.pass_context
+def circuit_breaker_reset_cmd(ctx: click.Context, endpoint_id: str) -> None:
+    """Reset (force close) the circuit breaker for an endpoint."""
+    store = get_store(ctx.obj["store_path"])
+    from .engine import DeliveryEngine
+    engine = DeliveryEngine(store)
+    result = engine.reset_circuit_breaker(endpoint_id)
+    if result is None:
+        console.print(f"[red]No circuit breaker found for endpoint: {endpoint_id}[/red]")
+        sys.exit(1)
+    console.print(f"[green]✓[/green] Circuit breaker reset for endpoint {endpoint_id[:12]}...")
+
+
+@cli.command("verify-signature")
+@click.option("--secret", "-s", required=True, help="HMAC secret")
+@click.option("--provider", "-p", type=click.Choice(["generic", "github", "stripe", "slack", "shopify"]), default="generic")
+@click.option("--algorithm", "-a", type=click.Choice(["sha256", "sha1"]), default="sha256")
+@click.option("--header", "-H", multiple=True, help="Request headers in 'Name: Value' format")
+@click.option("--tolerance", type=int, default=300, help="Max timestamp age in seconds")
+@click.argument("body")
+def verify_signature_cmd(
+    secret: str,
+    provider: str,
+    algorithm: str,
+    header: tuple[str, ...],
+    tolerance: int,
+    body: str,
+) -> None:
+    """Verify an incoming webhook HMAC signature."""
+    from .signature import SignatureVerifier, SignatureError
+
+    headers = {}
+    for h in header:
+        if ":" not in h:
+            console.print(f"[red]Invalid header format: {h}. Use 'Name: Value'[/red]")
+            sys.exit(1)
+        hname, hvalue = h.split(":", 1)
+        headers[hname.strip()] = hvalue.strip()
+
+    verifier = SignatureVerifier(tolerance_seconds=tolerance)
+    try:
+        verifier.verify_or_raise(
+            raw_body=body,
+            headers=headers,
+            secret=secret,
+            provider=provider,
+            algorithm=algorithm,
+        )
+        console.print(f"[green]✓[/green] Signature valid (provider: {provider})")
+    except SignatureError as e:
+        console.print(f"[red]✗[/red] Signature invalid: {e}")
+        sys.exit(1)
+
+
+@cli.command("detect-provider")
+@click.option("--header", "-H", multiple=True, help="Request headers in 'Name: Value' format")
+def detect_provider_cmd(header: tuple[str, ...]) -> None:
+    """Auto-detect webhook provider from request headers."""
+    from .signature import SignatureVerifier
+
+    headers = {}
+    for h in header:
+        if ":" not in h:
+            console.print(f"[red]Invalid header format: {h}. Use 'Name: Value'[/red]")
+            sys.exit(1)
+        hname, hvalue = h.split(":", 1)
+        headers[hname.strip()] = hvalue.strip()
+
+    verifier = SignatureVerifier()
+    provider = verifier.detect_provider(headers)
+    if provider:
+        console.print(f"[green]Detected provider:[/green] [bold]{provider}[/bold]")
+    else:
+        console.print("[yellow]Could not detect provider from headers.[/yellow]")
+
+
+# ── Relay Filter Commands ──────────────────────────────────────────
+
+
+@cli.group("relay-filter")
+def relay_filter() -> None:
+    """Manage relay rule filters for conditional forwarding."""
+    pass
+
+
+@relay_filter.command("set")
+@click.argument("rule_id")
+@click.option("--file", "-f", type=click.Path(exists=True), help="JSON file with filter rules")
+@click.option("--json", "json_str", type=str, help="Inline JSON filter rules")
+@click.pass_context
+def relay_filter_set(
+    ctx: click.Context,
+    rule_id: str,
+    file: str | None,
+    json_str: str | None,
+) -> None:
+    """Set filter rules on a relay rule."""
+    import json as _json
+
+    store = get_store(ctx.obj["store_path"])
+
+    if file:
+        with open(file) as f:
+            filter_rules = _json.load(f)
+    elif json_str:
+        filter_rules = _json.loads(json_str)
+    else:
+        console.print("[red]Provide filter rules via --file or --json[/red]")
+        sys.exit(1)
+
+    # Validate
+    from .filters import validate_filter_rules
+    errors = validate_filter_rules(filter_rules)
+    if errors:
+        console.print("[red]Filter validation errors:[/red]")
+        for e in errors:
+            console.print(f"  • {e}")
+        sys.exit(1)
+
+    if not hasattr(store, "update_relay_rule"):
+        console.print("[red]This store does not support relay rule updates[/red]")
+        sys.exit(1)
+
+    rule = store.update_relay_rule(rule_id, filter_rules=filter_rules)
+    if rule is None:
+        console.print(f"[red]Relay rule not found: {rule_id}[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓[/green] Filter rules set for relay rule: {rule.name}")
+
+
+@relay_filter.command("clear")
+@click.argument("rule_id")
+@click.pass_context
+def relay_filter_clear(ctx: click.Context, rule_id: str) -> None:
+    """Clear filter rules from a relay rule."""
+    store = get_store(ctx.obj["store_path"])
+
+    if not hasattr(store, "update_relay_rule"):
+        console.print("[red]This store does not support relay rule updates[/red]")
+        sys.exit(1)
+
+    rule = store.update_relay_rule(rule_id, filter_rules=None)
+    if rule is None:
+        console.print(f"[red]Relay rule not found: {rule_id}[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓[/green] Filter rules cleared for relay rule: {rule.name}")
+
+
+@relay_filter.command("validate")
+@click.option("--file", "-f", type=click.Path(exists=True), help="JSON file with filter rules")
+@click.option("--json", "json_str", type=str, help="Inline JSON filter rules")
+def relay_filter_validate_cmd(file: str | None, json_str: str | None) -> None:
+    """Validate filter rules without applying them."""
+    import json as _json
+
+    if file:
+        with open(file) as f:
+            filter_rules = _json.load(f)
+    elif json_str:
+        filter_rules = _json.loads(json_str)
+    else:
+        console.print("[red]Provide filter rules via --file or --json[/red]")
+        sys.exit(1)
+
+    from .filters import validate_filter_rules
+    errors = validate_filter_rules(filter_rules)
+    if errors:
+        console.print("[red]Validation errors:[/red]")
+        for e in errors:
+            console.print(f"  • {e}")
+        sys.exit(1)
+
+    console.print("[green]✓ Filter rules are valid[/green]")
+
+
+# ── Import/Export Commands ─────────────────────────────────────────
+
+
+@cli.command("export")
+@click.option("--file", "-f", type=click.Path(), required=True, help="Output JSON file path")
+@click.option("--endpoints/--no-endpoints", default=True)
+@click.option("--relay-rules/--no-relay-rules", default=True)
+@click.option("--transforms/--no-transforms", default=True)
+@click.option("--subscriptions/--no-subscriptions", default=True)
+@click.pass_context
+def export_cmd(
+    ctx: click.Context,
+    file: str,
+    endpoints: bool,
+    relay_rules: bool,
+    transforms: bool,
+    subscriptions: bool,
+) -> None:
+    """Export configuration to a JSON file."""
+    store = get_store(ctx.obj["store_path"])
+
+    from .import_export import export_to_file
+    summary = export_to_file(
+        store,
+        file,
+        include_endpoints=endpoints,
+        include_relay_rules=relay_rules,
+        include_transforms=transforms,
+        include_subscriptions=subscriptions,
+    )
+
+    console.print(f"[green]✓[/green] Configuration exported to {file}")
+    console.print(f"  Endpoints:      {summary.get('endpoints', 0)}")
+    console.print(f"  Relay Rules:    {summary.get('relay_rules', 0)}")
+    console.print(f"  Transforms:     {summary.get('transforms', 0)}")
+    console.print(f"  Subscriptions:  {summary.get('subscriptions', 0)}")
+
+
+@cli.command("import")
+@click.argument("file", type=click.Path(exists=True))
+@click.option("--strategy", "-s", type=click.Choice(["skip", "overwrite", "rename"]), default="skip")
+@click.option("--restore-secrets/--no-restore-secrets", default=False, help="Restore HMAC secrets from export")
+@click.pass_context
+def import_cmd(
+    ctx: click.Context,
+    file: str,
+    strategy: str,
+    restore_secrets: bool,
+) -> None:
+    """Import configuration from a JSON file."""
+    store = get_store(ctx.obj["store_path"])
+
+    from .import_export import import_from_file
+    summary = import_from_file(store, file, conflict_strategy=strategy, restore_secrets=restore_secrets)
+
+    console.print(f"[green]✓[/green] Import complete")
+    console.print(f"  Total Imported: {summary.get('total_imported', 0)}")
+    console.print(f"  Total Skipped:  {summary.get('total_skipped', 0)}")
+
+    detail = summary.get("imported", {})
+    if any(detail.values()):
+        console.print("\n[bold]Imported by type:[/bold]")
+        for k, v in detail.items():
+            if v:
+                console.print(f"  {k}: {v}")
+
+    if summary.get("errors"):
+        console.print(f"\n[red]Errors ({len(summary['errors'])}):[/red]")
+        for e in summary["errors"][:10]:
+            console.print(f"  • {e}")
+        if len(summary["errors"]) > 10:
+            console.print(f"  ... and {len(summary['errors']) - 10} more")
+
+
 @cli.command("rest-api")
 @click.option("--host", default="0.0.0.0", help="Host to bind to")
 @click.option("--port", default=8000, type=int, help="Port to bind to")
