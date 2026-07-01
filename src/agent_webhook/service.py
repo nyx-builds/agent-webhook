@@ -20,10 +20,12 @@ from .models import (
     RateLimitPeriod,
     RelayRule,
     RetryPolicy,
+    ScheduleInterval,
     TransformType,
     WebhookDelivery,
     WebhookEndpoint,
     WebhookMethod,
+    WebhookSchedule,
     WebhookStatus,
 )
 from .store import WebhookStore
@@ -157,6 +159,50 @@ class WebhookService:
             metadata=metadata or {},
             headers=headers or {},
         )
+
+    def schedule_webhook(
+        self,
+        endpoint_id: str,
+        payload: dict[str, Any],
+        scheduled_at: datetime,
+        event_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> WebhookDelivery | None:
+        """Schedule a webhook delivery for a future time.
+
+        The delivery is created in PENDING status with ``scheduled_at`` set.
+        The background worker (or ``process_pending``) will deliver it once
+        the scheduled time arrives.
+
+        Args:
+            endpoint_id: Target endpoint ID.
+            payload: JSON payload to deliver.
+            scheduled_at: When to deliver (must be in the future).
+            event_type: Optional event type tag.
+            metadata: Optional metadata.
+            headers: Optional per-delivery headers.
+
+        Returns:
+            The created ``WebhookDelivery``, or ``None`` if the endpoint
+            doesn't exist.
+        """
+        ep = self._store.get_endpoint(endpoint_id)
+        if ep is None:
+            return None
+
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+
+        delivery = WebhookDelivery(
+            endpoint_id=endpoint_id,
+            payload=payload,
+            event_type=event_type,
+            metadata=metadata or {},
+            payload_headers=headers or {},
+            scheduled_at=scheduled_at,
+        )
+        return self._store.add_delivery(delivery)
 
     async def batch_send(
         self,
@@ -607,6 +653,266 @@ class WebhookService:
         from .signature import SignatureVerifier
         verifier = SignatureVerifier()
         return verifier.detect_provider(headers)
+
+    # ── Recurring Schedules ──────────────────────────────────────────
+
+    def create_schedule(
+        self,
+        name: str,
+        endpoint_id: str,
+        payload: dict[str, Any],
+        interval_value: int,
+        interval_unit: str = "minutes",
+        event_type: str | None = None,
+        headers: dict[str, str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        max_runs: int = 0,
+        start_at: datetime | None = None,
+    ) -> WebhookSchedule | None:
+        """Create a recurring webhook delivery schedule.
+
+        Args:
+            name: Human-readable schedule name.
+            endpoint_id: Target endpoint ID (must exist).
+            payload: JSON payload to deliver on each run.
+            interval_value: Interval magnitude (e.g. 5 for every 5 minutes).
+            interval_unit: ``seconds``, ``minutes``, ``hours``, or ``days``.
+            event_type: Optional event type tag.
+            headers: Optional per-delivery headers.
+            metadata: Optional extra metadata.
+            max_runs: Maximum runs (0 = unlimited).
+            start_at: When to start (defaults to now).
+
+        Returns:
+            The created ``WebhookSchedule``, or ``None`` if endpoint doesn't exist.
+        """
+        ep = self._store.get_endpoint(endpoint_id)
+        if ep is None:
+            return None
+
+        if start_at is not None and start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=timezone.utc)
+        if start_at is None:
+            start_at = datetime.now(timezone.utc)
+
+        schedule = WebhookSchedule(
+            name=name,
+            endpoint_id=endpoint_id,
+            payload=payload,
+            interval_value=interval_value,
+            interval_unit=ScheduleInterval(interval_unit),
+            event_type=event_type,
+            headers=headers or {},
+            metadata=metadata or {},
+            max_runs=max_runs,
+            next_run_at=start_at,
+        )
+        return self._store.add_schedule(schedule)
+
+    def get_schedule(self, schedule_id: str) -> WebhookSchedule | None:
+        return self._store.get_schedule(schedule_id)
+
+    def list_schedules(
+        self,
+        endpoint_id: str | None = None,
+        active_only: bool = False,
+    ) -> list[WebhookSchedule]:
+        return self._store.list_schedules(endpoint_id=endpoint_id, active_only=active_only)
+
+    def update_schedule(self, schedule_id: str, **updates: Any) -> WebhookSchedule | None:
+        return self._store.update_schedule(schedule_id, **updates)
+
+    def pause_schedule(self, schedule_id: str) -> WebhookSchedule | None:
+        return self._store.update_schedule(schedule_id, active=False)
+
+    def resume_schedule(self, schedule_id: str) -> WebhookSchedule | None:
+        return self._store.update_schedule(schedule_id, active=True)
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        return self._store.delete_schedule(schedule_id)
+
+    async def process_due_schedules(self) -> list[WebhookDelivery]:
+        """Fire all due schedules — creates deliveries and advances their next_run_at.
+
+        This is called automatically by the worker or can be called manually.
+        Returns the list of created deliveries.
+        """
+        if not hasattr(self._store, "due_schedules"):
+            return []
+
+        due = self._store.due_schedules()
+        deliveries: list[WebhookDelivery] = []
+
+        for schedule in due:
+            # Create the delivery (in PENDING state, worker will process it)
+            delivery = WebhookDelivery(
+                endpoint_id=schedule.endpoint_id,
+                payload=schedule.payload,
+                event_type=schedule.event_type or f"schedule:{schedule.name}",
+                payload_headers=schedule.headers,
+                metadata={
+                    **schedule.metadata,
+                    "schedule_id": schedule.id,
+                    "schedule_run": schedule.run_count + 1,
+                },
+            )
+            self._store.add_delivery(delivery)
+            deliveries.append(delivery)
+
+            # Advance the schedule
+            now = datetime.now(timezone.utc)
+            new_run_count = schedule.run_count + 1
+            next_run = schedule.compute_next_run(now)
+
+            # Check if exhausted
+            updates: dict[str, Any] = {
+                "run_count": new_run_count,
+                "last_run_at": now,
+                "last_delivery_id": delivery.id,
+                "next_run_at": next_run,
+            }
+            if schedule.max_runs > 0 and new_run_count >= schedule.max_runs:
+                updates["active"] = False
+
+            self._store.update_schedule(schedule.id, **updates)
+
+        return deliveries
+
+    # ── Bulk Endpoint Operations ─────────────────────────────────────
+
+    def bulk_pause(self, endpoint_ids: list[str] | None = None, tag: str | None = None) -> list[str]:
+        """Pause multiple endpoints by IDs or tag. Returns list of paused endpoint IDs."""
+        targets = self._resolve_bulk_targets(endpoint_ids, tag)
+        paused = []
+        for eid in targets:
+            result = self._store.update_endpoint(eid, status=WebhookStatus.PAUSED)
+            if result is not None:
+                paused.append(eid)
+        return paused
+
+    def bulk_resume(self, endpoint_ids: list[str] | None = None, tag: str | None = None) -> list[str]:
+        """Resume multiple endpoints by IDs or tag. Returns list of resumed endpoint IDs."""
+        targets = self._resolve_bulk_targets(endpoint_ids, tag)
+        resumed = []
+        for eid in targets:
+            result = self._store.update_endpoint(eid, status=WebhookStatus.ACTIVE)
+            if result is not None:
+                resumed.append(eid)
+        return resumed
+
+    def bulk_disable(self, endpoint_ids: list[str] | None = None, tag: str | None = None) -> list[str]:
+        """Disable multiple endpoints by IDs or tag. Returns list of disabled endpoint IDs."""
+        targets = self._resolve_bulk_targets(endpoint_ids, tag)
+        disabled = []
+        for eid in targets:
+            result = self._store.update_endpoint(eid, status=WebhookStatus.DISABLED)
+            if result is not None:
+                disabled.append(eid)
+        return disabled
+
+    def bulk_delete(self, endpoint_ids: list[str] | None = None, tag: str | None = None) -> list[str]:
+        """Delete multiple endpoints by IDs or tag. Returns list of deleted endpoint IDs."""
+        targets = self._resolve_bulk_targets(endpoint_ids, tag)
+        deleted = []
+        for eid in targets:
+            if self._store.delete_endpoint(eid):
+                deleted.append(eid)
+        return deleted
+
+    def _resolve_bulk_targets(
+        self,
+        endpoint_ids: list[str] | None,
+        tag: str | None,
+    ) -> list[str]:
+        """Resolve the target endpoint IDs for bulk operations."""
+        if endpoint_ids is not None:
+            return endpoint_ids
+        if tag is not None:
+            return [e.id for e in self._store.list_endpoints(tag=tag)]
+        # No filter — return empty (safety: require explicit filter)
+        return []
+
+    # ── Dry-Run / Simulation ─────────────────────────────────────────
+
+    def simulate_delivery(
+        self,
+        endpoint_id: str,
+        payload: dict[str, Any],
+        event_type: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Simulate a webhook delivery without actually sending it.
+
+        Shows what would be sent: the target URL, method, headers (including
+        computed HMAC signature), transformed payload, and timing estimates.
+
+        Returns a dict with simulation details, or an error dict if the
+        endpoint doesn't exist.
+        """
+        ep = self._store.get_endpoint(endpoint_id)
+        if ep is None:
+            return {"error": f"Endpoint '{endpoint_id}' not found"}
+
+        delivery = WebhookDelivery(
+            endpoint_id=endpoint_id,
+            payload=payload,
+            event_type=event_type,
+            payload_headers=headers or {},
+        )
+
+        # Apply transforms (same logic as engine)
+        transformed = payload
+        if ep.transform_ids and hasattr(self._store, "get_transform"):
+            from .transforms import TransformEngine
+            te = TransformEngine()
+            transforms = []
+            for tid in ep.transform_ids:
+                t = self._store.get_transform(tid)
+                if t is not None:
+                    transforms.append(t)
+            if transforms:
+                transformed = te.apply(payload, transforms)
+
+        import json as _json
+        payload_str = _json.dumps(transformed, default=str)
+
+        # Compute signature if secret configured
+        signature = None
+        if ep.secret:
+            signature = self._engine.generate_hmac_signature(
+                ep.secret, payload_str, algorithm=ep.signing_algorithm.value
+            )
+
+        # Build the headers that would be sent
+        delivery_headers = self._engine.build_headers(ep, delivery, signature)
+
+        return {
+            "dry_run": True,
+            "endpoint_id": endpoint_id,
+            "endpoint_name": ep.name,
+            "endpoint_status": ep.status.value,
+            "url": ep.url,
+            "method": ep.method.value,
+            "event_type": event_type or "generic",
+            "original_payload": payload,
+            "transformed_payload": transformed if transformed != payload else None,
+            "payload_size_bytes": len(payload_str.encode()),
+            "headers": delivery_headers,
+            "signature_present": signature is not None,
+            "signature_preview": f"{signature[:40]}..." if signature and len(signature) > 40 else signature,
+            "timeout_seconds": ep.timeout_seconds,
+            "retry_policy": {
+                "max_retries": ep.retry_policy.max_retries,
+                "initial_delay_seconds": ep.retry_policy.initial_delay_seconds,
+                "max_delay_seconds": ep.retry_policy.max_delay_seconds,
+                "backoff_multiplier": ep.retry_policy.backoff_multiplier,
+                "retry_on_status_codes": ep.retry_policy.retry_on_status_codes,
+            },
+            "rate_limit": ep.rate_limit.model_dump() if ep.rate_limit else None,
+            "circuit_breaker_enabled": ep.circuit_breaker_enabled,
+            "circuit_breaker_state": self._engine.get_circuit_breaker_state(endpoint_id),
+            "estimated_delivery": "No HTTP request made (dry run)",
+        }
 
     async def close(self) -> None:
         await self._engine.close()

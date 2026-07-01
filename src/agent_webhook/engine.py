@@ -95,7 +95,7 @@ class DeliveryEngine:
         """Build headers for a webhook delivery."""
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "agent-webhook/0.5.0",
+            "User-Agent": "agent-webhook/0.6.0",
             "X-Webhook-ID": delivery.id,
             "X-Webhook-Event": delivery.event_type or "generic",
             "X-Webhook-Timestamp": datetime.now(timezone.utc).isoformat(),
@@ -326,8 +326,15 @@ class DeliveryEngine:
 
         # Execute attempt
         attempt = await self.deliver(delivery)
-        delivery.attempts.append(attempt)
+        # NOTE: add_delivery_attempt appends to the delivery internally,
+        # so we must NOT also append to delivery.attempts here — doing so
+        # with the JSON store (which returns the same object reference)
+        # would double-count the attempt and exhaust retries prematurely.
         self._store.add_delivery_attempt(delivery.id, attempt)
+        # Refresh delivery to reflect the attempt count from the store
+        delivery = self._store.get_delivery(delivery_id)
+        if delivery is None:
+            return None
 
         if attempt.status == DeliveryStatus.SUCCESS:
             delivery.status = DeliveryStatus.SUCCESS

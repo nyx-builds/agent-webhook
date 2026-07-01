@@ -1609,5 +1609,723 @@ def rest_api_cmd(ctx: click.Context, host: str, port: int, store_path: str) -> N
     uvicorn.run(app, host=host, port=port)
 
 
+# ── Analytics Commands ───────────────────────────────────────────────
+
+
+@cli.command("analytics")
+@click.option("--endpoint", "endpoint_id", default=None, help="Analytics for a single endpoint")
+@click.option("--retry", is_flag=True, help="Show retry analysis instead of overview")
+@click.option("--store", "store_path", default=DEFAULT_STORE_PATH, help="Path to store file")
+@click.pass_context
+def analytics_cmd(ctx: click.Context, endpoint_id: str | None, retry: bool, store_path: str) -> None:
+    """View delivery analytics: success rates, latency percentiles, error breakdown, trends."""
+    from .analytics import AnalyticsEngine
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    engine = AnalyticsEngine(service)
+
+    if retry:
+        report = engine.retry_analysis()
+        console.print("\n[bold cyan]Retry Analysis[/bold cyan]\n")
+        console.print(f"  Total Deliveries:    {report['total_deliveries']}")
+        console.print(f"  Deliveries Retried:  {report['deliveries_retried']} ({report['retry_rate_pct']}%)")
+        console.print(f"  Succeeded on Retry:  {report['succeeded_after_retry']}")
+        sr = report.get('retry_success_rate_pct')
+        console.print(f"  Retry Success Rate:  {f'{sr}%' if sr is not None else 'N/A'}")
+        console.print(f"  Dead Lettered:       {report['dead_lettered']} ({report['dead_letter_rate_pct']}%)")
+        console.print(f"  Avg Attempts:        {report['avg_attempts']}")
+        if report.get("attempt_distribution"):
+            console.print("\n[bold]Attempt Distribution:[/bold]")
+            for item in report["attempt_distribution"]:
+                console.print(f"    {item['attempts']} attempt(s): {item['count']} deliveries")
+        return
+
+    if endpoint_id:
+        report = engine.endpoint_report(endpoint_id)
+        if report is None:
+            console.print(f"[red]Endpoint not found: {endpoint_id}[/red]")
+            sys.exit(1)
+        console.print(f"\n[bold cyan]Analytics: {report['endpoint_name']}[/bold cyan]\n")
+        s = report["summary"]
+        console.print(f"  Total Deliveries:  {s['total_deliveries']}")
+        console.print(f"  Successful:        {s['successful']}")
+        console.print(f"  Failed:            {s['failed']}")
+        console.print(f"  Dead Lettered:     {s['dead_letter']}")
+        sr = s.get('success_rate_pct')
+        console.print(f"  Success Rate:      {f'{sr}%' if sr is not None else 'N/A'}")
+        console.print(f"  Health Score:      {s['health_score']}/100")
+        lat = report.get("latency", {})
+        if lat.get("count"):
+            console.print(f"\n[bold]Latency (ms):[/bold]")
+            console.print(f"    Avg: {lat.get('avg_ms')}  P50: {lat.get('p50_ms')}  P90: {lat.get('p90_ms')}  P95: {lat.get('p95_ms')}  P99: {lat.get('p99_ms')}")
+        eb = report.get("error_breakdown", {})
+        if eb.get("by_status_code"):
+            console.print(f"\n[bold]Status Codes:[/bold]")
+            for item in eb["by_status_code"][:10]:
+                console.print(f"    {item['status_code']}: {item['count']}")
+        return
+
+    report = engine.overall_report()
+    console.print("\n[bold cyan]Delivery Analytics Overview[/bold cyan]\n")
+    s = report["summary"]
+    console.print(f"  Total Deliveries:  {s['total_deliveries']}")
+    console.print(f"  Successful:        {s['successful']}")
+    console.print(f"  Failed:            {s['failed']}")
+    console.print(f"  Pending:           {s['pending']}")
+    console.print(f"  Retrying:          {s['retrying']}")
+    console.print(f"  Dead Lettered:     {s['dead_letter']}")
+    console.print(f"  Abandoned:         {s['abandoned']}")
+    sr = s.get('success_rate_pct')
+    console.print(f"  Success Rate:      {f'{sr}%' if sr is not None else 'N/A'}")
+    console.print(f"  Total Attempts:    {s['total_attempts']}")
+    console.print(f"  Avg Attempts/Delivery: {s['avg_attempts_per_delivery']}")
+    console.print(f"\n  [bold green]Health Score: {s['health_score']}/100[/bold green]")
+
+    lat = report.get("latency", {})
+    if lat.get("count"):
+        console.print(f"\n[bold]Latency (ms):[/bold]")
+        console.print(f"    Min: {lat.get('min_ms')}  Max: {lat.get('max_ms')}  Avg: {lat.get('avg_ms')}")
+        console.print(f"    P50: {lat.get('p50_ms')}  P90: {lat.get('p90_ms')}  P95: {lat.get('p95_ms')}  P99: {lat.get('p99_ms')}")
+
+    eb = report.get("error_breakdown", {})
+    if eb.get("by_status_code"):
+        console.print(f"\n[bold]Top Status Codes:[/bold]")
+        for item in eb["by_status_code"][:10]:
+            console.print(f"    {item['status_code']}: {item['count']}")
+
+    if report.get("top_endpoints_by_volume"):
+        console.print(f"\n[bold]Top Endpoints by Volume:[/bold]")
+        for item in report["top_endpoints_by_volume"][:5]:
+            console.print(f"    {item['endpoint_id'][:8]}... total={item['total']} success={item.get('success_rate', 0)}%")
+
+    if report.get("worst_endpoints_by_failure"):
+        console.print(f"\n[bold red]Worst Endpoints by Failure:[/bold red]")
+        for item in report["worst_endpoints_by_failure"][:5]:
+            console.print(f"    {item['endpoint_id'][:8]}... total={item['total']} failure={item.get('failure_rate', 0)}%")
+
+
+# ── Template Commands ────────────────────────────────────────────────
+
+
+@cli.command("template")
+@click.argument("action", type=click.Choice(["list", "show", "create"]))
+@click.option("--key", default=None, help="Template key (e.g. slack, discord)")
+@click.option("--tag", default=None, help="Filter templates by tag")
+@click.option("--url", default=None, help="Webhook URL (required for 'create')")
+@click.option("--name", default=None, help="Custom endpoint name")
+@click.option("--secret", default=None, help="HMAC signing secret")
+@click.option("--description", default=None, help="Endpoint description")
+@click.option("--header", "extra_headers", multiple=True, help="Extra headers in 'Name: Value' format")
+@click.option("--store", "store_path", default=DEFAULT_STORE_PATH, help="Path to store file")
+@click.pass_context
+def template_cmd(
+    ctx: click.Context,
+    action: str,
+    key: str | None,
+    tag: str | None,
+    url: str | None,
+    name: str | None,
+    secret: str | None,
+    description: str | None,
+    extra_headers: tuple[str, ...],
+    store_path: str,
+) -> None:
+    """List, inspect, or create endpoints from pre-built templates."""
+    from .templates import TemplateRegistry
+    from .service import WebhookService
+    from .models import Header
+
+    registry = TemplateRegistry()
+
+    if action == "list":
+        templates = registry.list_templates(tag=tag)
+        if not templates:
+            console.print("[yellow]No templates found.[/yellow]")
+            return
+        console.print(f"\n[bold cyan]Available Templates ({len(templates)})[/bold cyan]\n")
+        for t in templates:
+            tags_str = f" [{', '.join(t['tags'])}]" if t.get("tags") else ""
+            console.print(f"  [bold]{t['key']}[/bold] — {t['name']}{tags_str}")
+            console.print(f"    {t['description']}")
+            if t.get("url_placeholder"):
+                console.print(f"    URL: {t['url_placeholder']}")
+            console.print()
+        return
+
+    if action == "show":
+        if not key:
+            console.print("[red]--key is required for 'show'[/red]")
+            sys.exit(1)
+        template = registry.get_template(key)
+        if template is None:
+            console.print(f"[red]Template not found: {key}[/red]")
+            console.print(f"Available: {', '.join(registry.keys)}")
+            sys.exit(1)
+        d = template.to_dict()
+        console.print(f"\n[bold cyan]Template: {d['name']}[/bold cyan]\n")
+        for k, v in d.items():
+            if k in ("key", "name"):
+                continue
+            console.print(f"  {k}: {v}")
+        return
+
+    if action == "create":
+        if not key:
+            console.print("[red]--key is required for 'create'[/red]")
+            sys.exit(1)
+        if not url:
+            console.print("[red]--url is required for 'create'[/red]")
+            console.print(f"Use 'agent-webhook template show --key {key}' to see URL format")
+            sys.exit(1)
+
+        hdrs: dict[str, str] = {}
+        for h in extra_headers:
+            if ":" in h:
+                hn, hv = h.split(":", 1)
+                hdrs[hn.strip()] = hv.strip()
+
+        endpoint = registry.create_endpoint(
+            key=key,
+            url=url,
+            name=name,
+            secret=secret,
+            description=description,
+            extra_headers=hdrs if hdrs else None,
+        )
+        if endpoint is None:
+            console.print(f"[red]Template not found: {key}[/red]")
+            console.print(f"Available: {', '.join(registry.keys)}")
+            sys.exit(1)
+
+        service = WebhookService(store_path=store_path)
+        ep = service.create_endpoint(
+            name=endpoint.name,
+            url=endpoint.url,
+            method=endpoint.method.value,
+            headers={h.name: h.value for h in endpoint.headers},
+            tags=endpoint.tags,
+            secret=endpoint.secret,
+            timeout_seconds=endpoint.timeout_seconds,
+            description=endpoint.description,
+            max_retries=endpoint.retry_policy.max_retries,
+            initial_delay_seconds=endpoint.retry_policy.initial_delay_seconds,
+            max_delay_seconds=endpoint.retry_policy.max_delay_seconds,
+            backoff_multiplier=endpoint.retry_policy.backoff_multiplier,
+            retry_on_status_codes=endpoint.retry_policy.retry_on_status_codes,
+        )
+        console.print(f"[green]✓[/green] Created endpoint from '{key}' template")
+        console.print(f"  ID:   {ep.id}")
+        console.print(f"  Name: {ep.name}")
+        console.print(f"  URL:  {ep.url}")
+
+
+# ── Schedule Command ─────────────────────────────────────────────────
+
+
+@cli.command("schedule")
+@click.argument("endpoint_id")
+@click.argument("payload")
+@click.option("--at", "scheduled_at", required=True, help="ISO 8601 datetime (e.g. 2025-12-25T10:00:00Z or +1h or +30m)")
+@click.option("--event-type", default=None, help="Event type tag")
+@click.option("--header", "headers", multiple=True, help="Extra headers 'Name: Value'")
+@click.option("--store", "store_path", default=DEFAULT_STORE_PATH, help="Path to store file")
+@click.pass_context
+def schedule_cmd(
+    ctx: click.Context,
+    endpoint_id: str,
+    payload: str,
+    scheduled_at: str,
+    event_type: str | None,
+    headers: tuple[str, ...],
+    store_path: str,
+) -> None:
+    """Schedule a webhook delivery for a future time.
+
+    Use --at with an ISO datetime or relative time like +1h, +30m, +2d.
+    """
+    import json as _json
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+
+    # Parse scheduled_at
+    at: _dt
+    if scheduled_at.startswith("+"):
+        # Relative time: +1h, +30m, +2d
+        unit_map = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+        match = re.match(r"\+(\d+)([smhd])", scheduled_at)
+        if not match:
+            console.print(f"[red]Invalid relative time: {scheduled_at}. Use format like +1h, +30m, +2d[/red]")
+            sys.exit(1)
+        amount = int(match.group(1))
+        unit = unit_map[match.group(2)]
+        at = _dt.now(_tz.utc) + _td(**{unit: amount})
+    else:
+        try:
+            at = _dt.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+        except ValueError:
+            console.print(f"[red]Invalid datetime: {scheduled_at}[/red]")
+            sys.exit(1)
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=_tz.utc)
+
+    # Parse payload
+    try:
+        payload_data = _json.loads(payload)
+    except _json.JSONDecodeError:
+        console.print(f"[red]Invalid JSON payload[/red]")
+        sys.exit(1)
+
+    # Parse headers
+    hdrs: dict[str, str] = {}
+    for h in headers:
+        if ":" in h:
+            hn, hv = h.split(":", 1)
+            hdrs[hn.strip()] = hv.strip()
+
+    delivery = service.schedule_webhook(
+        endpoint_id=endpoint_id,
+        payload=payload_data,
+        scheduled_at=at,
+        event_type=event_type,
+        headers=hdrs if hdrs else None,
+    )
+    if delivery is None:
+        console.print(f"[red]Endpoint not found: {endpoint_id}[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓[/green] Scheduled webhook delivery")
+    console.print(f"  Delivery ID:  {delivery.id}")
+    console.print(f"  Endpoint:     {endpoint_id}")
+    console.print(f"  Scheduled At: {at.isoformat()}")
+    console.print(f"  Status:       {delivery.status.value}")
+
+
+# ── Recurring Schedules ──────────────────────────────────────────────
+
+
+@cli.group("schedule")
+def schedule_group() -> None:
+    """Manage recurring webhook delivery schedules."""
+
+
+@schedule_group.command("create")
+@click.option("--name", required=True, help="Schedule name")
+@click.option("--endpoint-id", required=True, help="Target endpoint ID")
+@click.option("--payload", required=True, help="JSON payload to deliver on each run")
+@click.option("--interval", "interval_value", required=True, type=int, help="Interval magnitude")
+@click.option(
+    "--unit", "interval_unit",
+    type=click.Choice(["seconds", "minutes", "hours", "days"]),
+    default="minutes",
+    help="Interval unit",
+)
+@click.option("--event-type", default=None, help="Event type tag")
+@click.option("--max-runs", default=0, type=int, help="Maximum runs (0 = unlimited)")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def schedule_create(
+    name: str,
+    endpoint_id: str,
+    payload: str,
+    interval_value: int,
+    interval_unit: str,
+    event_type: str | None,
+    max_runs: int,
+    store_path: str,
+) -> None:
+    """Create a recurring webhook delivery schedule."""
+    import json as _json
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+
+    try:
+        payload_data = _json.loads(payload)
+    except _json.JSONDecodeError:
+        console.print("[red]Invalid JSON payload[/red]")
+        sys.exit(1)
+
+    schedule = service.create_schedule(
+        name=name,
+        endpoint_id=endpoint_id,
+        payload=payload_data,
+        interval_value=interval_value,
+        interval_unit=interval_unit,
+        event_type=event_type,
+        max_runs=max_runs,
+    )
+    if schedule is None:
+        console.print(f"[red]Endpoint not found: {endpoint_id}[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓[/green] Created recurring schedule")
+    console.print(f"  Schedule ID:     {schedule.id}")
+    console.print(f"  Name:            {schedule.name}")
+    console.print(f"  Endpoint:        {schedule.endpoint_id}")
+    console.print(f"  Interval:        Every {schedule.interval_value} {schedule.interval_unit.value}")
+    console.print(f"  Max Runs:        {'unlimited' if schedule.max_runs == 0 else schedule.max_runs}")
+    console.print(f"  Next Run At:     {format_dt(schedule.next_run_at)}")
+    console.print(f"  Active:          {schedule.active}")
+
+
+@schedule_group.command("list")
+@click.option("--endpoint-id", default=None, help="Filter by endpoint")
+@click.option("--active-only", is_flag=True, default=False, help="Show only active schedules")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def schedule_list(
+    endpoint_id: str | None,
+    active_only: bool,
+    store_path: str,
+) -> None:
+    """List recurring schedules."""
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    schedules = service.list_schedules(endpoint_id=endpoint_id, active_only=active_only)
+
+    if not schedules:
+        console.print("[dim]No schedules found[/dim]")
+        return
+
+    table = Table(title="Recurring Schedules")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("Endpoint")
+    table.add_column("Interval")
+    table.add_column("Runs", justify="right")
+    table.add_column("Next Run")
+    table.add_column("Active")
+
+    for s in schedules:
+        max_str = f"{s.run_count}/{s.max_runs}" if s.max_runs > 0 else str(s.run_count)
+        table.add_row(
+            s.id[:12],
+            s.name,
+            s.endpoint_id[:12],
+            f"{s.interval_value} {s.interval_unit.value}",
+            max_str,
+            format_dt(s.next_run_at),
+            "✓" if s.active else "✗",
+        )
+    console.print(table)
+
+
+@schedule_group.command("pause")
+@click.argument("schedule_id")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def schedule_pause(schedule_id: str, store_path: str) -> None:
+    """Pause a recurring schedule."""
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    schedule = service.pause_schedule(schedule_id)
+    if schedule is None:
+        console.print(f"[red]Schedule not found: {schedule_id}[/red]")
+        sys.exit(1)
+    console.print(f"[yellow]⏸[/yellow] Paused schedule: {schedule.name}")
+
+
+@schedule_group.command("resume")
+@click.argument("schedule_id")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def schedule_resume(schedule_id: str, store_path: str) -> None:
+    """Resume a paused recurring schedule."""
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    schedule = service.resume_schedule(schedule_id)
+    if schedule is None:
+        console.print(f"[red]Schedule not found: {schedule_id}[/red]")
+        sys.exit(1)
+    console.print(f"[green]▶[/green] Resumed schedule: {schedule.name}")
+
+
+@schedule_group.command("delete")
+@click.argument("schedule_id")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def schedule_delete(schedule_id: str, store_path: str) -> None:
+    """Delete a recurring schedule."""
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    if service.delete_schedule(schedule_id):
+        console.print(f"[red]✗[/red] Deleted schedule: {schedule_id}")
+    else:
+        console.print(f"[red]Schedule not found: {schedule_id}[/red]")
+        sys.exit(1)
+
+
+@schedule_group.command("show")
+@click.argument("schedule_id")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def schedule_show(schedule_id: str, store_path: str) -> None:
+    """Show details of a recurring schedule."""
+    import json as _json
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    schedule = service.get_schedule(schedule_id)
+    if schedule is None:
+        console.print(f"[red]Schedule not found: {schedule_id}[/red]")
+        sys.exit(1)
+    console.print_json(_json.dumps(schedule.model_dump(mode="json"), default=str))
+
+
+@schedule_group.command("fire")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def schedule_fire(store_path: str) -> None:
+    """Manually fire all due schedules (normally handled by the worker)."""
+    import asyncio
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+
+    async def _fire() -> list:
+        return await service.process_due_schedules()
+
+    deliveries = asyncio.run(_fire())
+    if not deliveries:
+        console.print("[dim]No schedules due[/dim]")
+        return
+    console.print(f"[green]✓[/green] Fired {len(deliveries)} schedule(s)")
+    for d in deliveries:
+        console.print(f"  Delivery: {d.id}  Endpoint: {d.endpoint_id[:12]}  Status: {d.status.value}")
+
+
+# ── Bulk Endpoint Operations ─────────────────────────────────────────
+
+
+@cli.group("bulk")
+def bulk_group() -> None:
+    """Bulk endpoint operations (pause, resume, disable, delete)."""
+
+
+def _bulk_resolve(store_path: str, endpoint_ids: tuple[str, ...] | None, tag: str | None) -> list[str]:
+    """Resolve bulk targets from IDs or tag."""
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    if tag:
+        return [e.id for e in service.list_endpoints(tag=tag)]
+    return list(endpoint_ids) if endpoint_ids else []
+
+
+@bulk_group.command("pause")
+@click.option("--endpoint-id", "endpoint_ids", multiple=True, help="Endpoint IDs to pause")
+@click.option("--tag", default=None, help="Pause all endpoints with this tag")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def bulk_pause(endpoint_ids: tuple[str, ...], tag: str | None, store_path: str) -> None:
+    """Pause multiple endpoints by IDs or tag."""
+    from .service import WebhookService
+
+    if not endpoint_ids and not tag:
+        console.print("[red]Specify --endpoint-id or --tag[/red]")
+        sys.exit(1)
+    service = WebhookService(store_path=store_path)
+    paused = service.bulk_pause(endpoint_ids=list(endpoint_ids) or None, tag=tag)
+    console.print(f"[yellow]⏸[/yellow] Paused {len(paused)} endpoint(s): {', '.join(paused)}")
+
+
+@bulk_group.command("resume")
+@click.option("--endpoint-id", "endpoint_ids", multiple=True, help="Endpoint IDs to resume")
+@click.option("--tag", default=None, help="Resume all endpoints with this tag")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def bulk_resume(endpoint_ids: tuple[str, ...], tag: str | None, store_path: str) -> None:
+    """Resume multiple endpoints by IDs or tag."""
+    from .service import WebhookService
+
+    if not endpoint_ids and not tag:
+        console.print("[red]Specify --endpoint-id or --tag[/red]")
+        sys.exit(1)
+    service = WebhookService(store_path=store_path)
+    resumed = service.bulk_resume(endpoint_ids=list(endpoint_ids) or None, tag=tag)
+    console.print(f"[green]▶[/green] Resumed {len(resumed)} endpoint(s): {', '.join(resumed)}")
+
+
+@bulk_group.command("disable")
+@click.option("--endpoint-id", "endpoint_ids", multiple=True, help="Endpoint IDs to disable")
+@click.option("--tag", default=None, help="Disable all endpoints with this tag")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def bulk_disable(endpoint_ids: tuple[str, ...], tag: str | None, store_path: str) -> None:
+    """Disable multiple endpoints by IDs or tag."""
+    from .service import WebhookService
+
+    if not endpoint_ids and not tag:
+        console.print("[red]Specify --endpoint-id or --tag[/red]")
+        sys.exit(1)
+    service = WebhookService(store_path=store_path)
+    disabled = service.bulk_disable(endpoint_ids=list(endpoint_ids) or None, tag=tag)
+    console.print(f"[red]✗[/red] Disabled {len(disabled)} endpoint(s): {', '.join(disabled)}")
+
+
+@bulk_group.command("delete")
+@click.option("--endpoint-id", "endpoint_ids", multiple=True, help="Endpoint IDs to delete")
+@click.option("--tag", default=None, help="Delete all endpoints with this tag")
+@click.confirmation_option(prompt="Are you sure you want to delete these endpoints?")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def bulk_delete(endpoint_ids: tuple[str, ...], tag: str | None, store_path: str) -> None:
+    """Delete multiple endpoints by IDs or tag."""
+    from .service import WebhookService
+
+    if not endpoint_ids and not tag:
+        console.print("[red]Specify --endpoint-id or --tag[/red]")
+        sys.exit(1)
+    service = WebhookService(store_path=store_path)
+    deleted = service.bulk_delete(endpoint_ids=list(endpoint_ids) or None, tag=tag)
+    console.print(f"[red]✗[/red] Deleted {len(deleted)} endpoint(s): {', '.join(deleted)}")
+
+
+# ── Dry-Run / Simulation ─────────────────────────────────────────────
+
+
+@cli.command("simulate")
+@click.argument("endpoint_id")
+@click.option("--payload", required=True, help="JSON payload to simulate")
+@click.option("--event-type", default=None, help="Event type")
+@click.option("--header", "headers", multiple=True, help="Extra headers (format: Key:Value)")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.json",
+    help="Store file path",
+)
+def simulate_cmd(
+    endpoint_id: str,
+    payload: str,
+    event_type: str | None,
+    headers: tuple[str, ...],
+    store_path: str,
+) -> None:
+    """Simulate a webhook delivery without sending it (dry run).
+
+    Shows what would be sent: URL, method, headers, HMAC signature,
+    transformed payload, retry config, circuit breaker state.
+    """
+    import json as _json
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+
+    try:
+        payload_data = _json.loads(payload)
+    except _json.JSONDecodeError:
+        console.print("[red]Invalid JSON payload[/red]")
+        sys.exit(1)
+
+    hdrs: dict[str, str] = {}
+    for h in headers:
+        if ":" in h:
+            hn, hv = h.split(":", 1)
+            hdrs[hn.strip()] = hv.strip()
+
+    result = service.simulate_delivery(
+        endpoint_id=endpoint_id,
+        payload=payload_data,
+        event_type=event_type,
+        headers=hdrs if hdrs else None,
+    )
+
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/red]")
+        sys.exit(1)
+
+    console.print(f"[cyan]🔍 Dry Run Simulation[/cyan]")
+    console.print(f"  Endpoint:     {result['endpoint_name']} ({result['endpoint_id'][:12]})")
+    console.print(f"  Status:       {result['endpoint_status']}")
+    console.print(f"  URL:          {result['url']}")
+    console.print(f"  Method:       {result['method']}")
+    console.print(f"  Event Type:   {result['event_type']}")
+    console.print(f"  Timeout:      {result['timeout_seconds']}s")
+    console.print()
+
+    if result.get("transformed_payload"):
+        console.print(f"[yellow]Transformed Payload:[/yellow]")
+        console.print_json(_json.dumps(result["transformed_payload"], default=str))
+    else:
+        console.print(f"[dim]Payload (no transforms):[/dim]")
+        console.print_json(_json.dumps(result["original_payload"], default=str))
+
+    console.print(f"\n[yellow]Headers that would be sent:[/yellow]")
+    for hn, hv in result["headers"].items():
+        display = hv
+        if hn.lower() in ("x-webhook-signature",) and len(hv) > 50:
+            display = hv[:50] + "..."
+        console.print(f"  {hn}: {display}")
+
+    console.print(f"\n[dim]Signature present: {result['signature_present']}[/dim]")
+    console.print(f"[dim]Payload size: {result['payload_size_bytes']} bytes[/dim]")
+    console.print(f"[dim]Circuit breaker: {result['circuit_breaker_state'] or 'Not tracked'}[/dim]")
+
+    rp = result["retry_policy"]
+    console.print(f"\n[cyan]Retry Policy:[/cyan]")
+    console.print(f"  Max retries:           {rp['max_retries']}")
+    console.print(f"  Initial delay:         {rp['initial_delay_seconds']}s")
+    console.print(f"  Backoff multiplier:    {rp['backoff_multiplier']}x")
+    console.print(f"  Retry on status codes: {rp['retry_on_status_codes']}")
+
+    if result.get("rate_limit"):
+        console.print(f"\n[cyan]Rate Limit:[/cyan]")
+        console.print_json(_json.dumps(result["rate_limit"], default=str))
+
+    console.print(f"\n[green]✓[/green] No HTTP request was made (dry run).")
+
+
 if __name__ == "__main__":
     cli()

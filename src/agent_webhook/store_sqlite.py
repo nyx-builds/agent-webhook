@@ -20,6 +20,7 @@ from .models import (
     RelayRule,
     WebhookDelivery,
     WebhookEndpoint,
+    WebhookSchedule,
     WebhookStatus,
 )
 
@@ -101,6 +102,19 @@ CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_dead_letter_endpoint ON dead_letter_queue(endpoint_id);
 CREATE INDEX IF NOT EXISTS idx_dead_letter_replayed ON dead_letter_queue(replayed);
 CREATE INDEX IF NOT EXISTS idx_transforms_name ON transforms(name);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    endpoint_id TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    next_run_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedules_endpoint ON schedules(endpoint_id);
+CREATE INDEX IF NOT EXISTS idx_schedules_active ON schedules(active);
+CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run_at);
 """
 
 
@@ -521,6 +535,9 @@ class SQLiteStore:
         for d in deliveries:
             d.attempts = self._get_attempts_for_delivery(d.id)
             if d.status == DeliveryStatus.PENDING:
+                # Skip scheduled deliveries that aren't due yet
+                if d.scheduled_at is not None and d.scheduled_at > now:
+                    continue
                 result.append(d)
             elif d.status == DeliveryStatus.RETRYING and (d.next_retry_at is None or d.next_retry_at <= now):
                 result.append(d)
@@ -701,3 +718,93 @@ class SQLiteStore:
             conn.commit()
 
         return counts
+
+    # --- Schedules ---
+
+    def add_schedule(self, schedule: WebhookSchedule) -> WebhookSchedule:
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO schedules (id, endpoint_id, active, next_run_at, created_at, data) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    schedule.id,
+                    schedule.endpoint_id,
+                    1 if schedule.active else 0,
+                    schedule.next_run_at.isoformat(),
+                    schedule.created_at.isoformat(),
+                    schedule.model_dump_json(),
+                ),
+            )
+            conn.commit()
+        return schedule
+
+    def get_schedule(self, schedule_id: str) -> WebhookSchedule | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT data FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+        if row is None:
+            return None
+        return WebhookSchedule.model_validate_json(row["data"])
+
+    def list_schedules(
+        self,
+        endpoint_id: str | None = None,
+        active_only: bool = False,
+    ) -> list[WebhookSchedule]:
+        conn = self._get_conn()
+        if endpoint_id is not None and active_only:
+            rows = conn.execute(
+                "SELECT data FROM schedules WHERE endpoint_id = ? AND active = 1 ORDER BY created_at",
+                (endpoint_id,),
+            ).fetchall()
+        elif endpoint_id is not None:
+            rows = conn.execute(
+                "SELECT data FROM schedules WHERE endpoint_id = ? ORDER BY created_at",
+                (endpoint_id,),
+            ).fetchall()
+        elif active_only:
+            rows = conn.execute(
+                "SELECT data FROM schedules WHERE active = 1 ORDER BY created_at"
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT data FROM schedules ORDER BY created_at").fetchall()
+        return [WebhookSchedule.model_validate_json(r["data"]) for r in rows]
+
+    def update_schedule(self, schedule_id: str, **updates: Any) -> WebhookSchedule | None:
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute("SELECT data FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+            if row is None:
+                return None
+            schedule = WebhookSchedule.model_validate_json(row["data"])
+            from datetime import datetime, timezone
+            for key, value in updates.items():
+                if hasattr(schedule, key):
+                    setattr(schedule, key, value)
+            schedule.updated_at = datetime.now(timezone.utc)
+            conn.execute(
+                "UPDATE schedules SET data = ?, active = ?, next_run_at = ? WHERE id = ?",
+                (
+                    schedule.model_dump_json(),
+                    1 if schedule.active else 0,
+                    schedule.next_run_at.isoformat() if schedule.next_run_at else datetime.now(timezone.utc).isoformat(),
+                    schedule_id,
+                ),
+            )
+            conn.commit()
+        return schedule
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def due_schedules(self) -> list[WebhookSchedule]:
+        """Get all active schedules that are due to run."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT data FROM schedules WHERE active = 1 ORDER BY next_run_at"
+        ).fetchall()
+        schedules = [WebhookSchedule.model_validate_json(r["data"]) for r in rows]
+        return [s for s in schedules if s.is_due()]

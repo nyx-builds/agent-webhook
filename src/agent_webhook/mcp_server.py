@@ -621,6 +621,211 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     "required": ["data"],
                 },
             ),
+            Tool(
+                name="analytics_overview",
+                description="Get comprehensive delivery analytics: success rates, latency percentiles (p50/p90/p95/p99), error breakdown, top/worst endpoints, hourly trends, and a health score (0-100).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "default": 10000, "description": "Max deliveries to analyse"},
+                    },
+                },
+            ),
+            Tool(
+                name="analytics_endpoint",
+                description="Get delivery analytics for a single endpoint: success rate, latency percentiles, error breakdown, trend, and health score.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID to analyse"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="analytics_retry",
+                description="Analyse retry patterns: how often retries are needed, retry success rate, dead letter rate, and attempt distribution.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "default": 10000},
+                    },
+                },
+            ),
+            Tool(
+                name="template_list",
+                description="List pre-built endpoint templates for popular services (Slack, Discord, Teams, Telegram, PagerDuty, etc.). Filter by tag.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "tag": {"type": "string", "description": "Filter by tag (e.g. messaging, automation, notifications)"},
+                    },
+                },
+            ),
+            Tool(
+                name="template_get",
+                description="Get details for a specific endpoint template by key (e.g. slack, discord, teams).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Template key (e.g. slack, discord)"},
+                    },
+                    "required": ["key"],
+                },
+            ),
+            Tool(
+                name="endpoint_from_template",
+                description="Create a webhook endpoint from a pre-built template. Requires template key and URL. Optional: custom name, secret, description, extra headers.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Template key (e.g. slack, discord, teams, telegram, github_api, zapier, pagerduty)"},
+                        "url": {"type": "string", "description": "Webhook URL for the target service"},
+                        "name": {"type": "string", "description": "Custom endpoint name"},
+                        "secret": {"type": "string", "description": "HMAC signing secret"},
+                        "description": {"type": "string"},
+                        "extra_headers": {"type": "object", "description": "Additional headers as key-value pairs"},
+                    },
+                    "required": ["key", "url"],
+                },
+            ),
+            Tool(
+                name="webhook_schedule",
+                description="Schedule a webhook delivery for a future time. The delivery stays PENDING until scheduled_at, then the worker processes it.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string"},
+                        "payload": {"type": "object", "description": "JSON payload to deliver"},
+                        "scheduled_at": {"type": "string", "description": "ISO 8601 datetime for when to deliver (e.g. 2025-12-25T10:00:00Z)"},
+                        "event_type": {"type": "string"},
+                        "metadata": {"type": "object"},
+                        "headers": {"type": "object", "description": "Extra headers for this delivery"},
+                    },
+                    "required": ["endpoint_id", "payload", "scheduled_at"],
+                },
+            ),
+            Tool(
+                name="recurring_schedule_create",
+                description="Create a recurring webhook delivery schedule. Periodically sends a payload to an endpoint at a fixed interval. Supports max_runs for finite schedules.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Human-readable schedule name"},
+                        "endpoint_id": {"type": "string", "description": "Target endpoint ID"},
+                        "payload": {"type": "object", "description": "JSON payload to deliver on each run"},
+                        "interval_value": {"type": "integer", "description": "Interval magnitude (e.g. 5 for every 5 minutes)", "minimum": 1},
+                        "interval_unit": {"type": "string", "enum": ["seconds", "minutes", "hours", "days"], "default": "minutes"},
+                        "event_type": {"type": "string"},
+                        "headers": {"type": "object", "description": "Per-delivery headers"},
+                        "metadata": {"type": "object"},
+                        "max_runs": {"type": "integer", "default": 0, "description": "Maximum runs (0 = unlimited)"},
+                    },
+                    "required": ["name", "endpoint_id", "payload", "interval_value"],
+                },
+            ),
+            Tool(
+                name="recurring_schedule_list",
+                description="List recurring webhook schedules. Filter by endpoint or active status.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Filter by endpoint ID"},
+                        "active_only": {"type": "boolean", "default": False},
+                    },
+                },
+            ),
+            Tool(
+                name="recurring_schedule_pause",
+                description="Pause a recurring webhook schedule (stops firing until resumed).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "schedule_id": {"type": "string"},
+                    },
+                    "required": ["schedule_id"],
+                },
+            ),
+            Tool(
+                name="recurring_schedule_resume",
+                description="Resume a paused recurring webhook schedule.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "schedule_id": {"type": "string"},
+                    },
+                    "required": ["schedule_id"],
+                },
+            ),
+            Tool(
+                name="recurring_schedule_delete",
+                description="Delete a recurring webhook schedule.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "schedule_id": {"type": "string"},
+                    },
+                    "required": ["schedule_id"],
+                },
+            ),
+            Tool(
+                name="bulk_endpoint_pause",
+                description="Pause multiple webhook endpoints at once. Specify endpoint_ids list and/or tag to select targets.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_ids": {"type": "array", "items": {"type": "string"}, "description": "List of endpoint IDs to pause"},
+                        "tag": {"type": "string", "description": "Pause all endpoints with this tag"},
+                    },
+                },
+            ),
+            Tool(
+                name="bulk_endpoint_resume",
+                description="Resume multiple webhook endpoints at once. Specify endpoint_ids list and/or tag to select targets.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_ids": {"type": "array", "items": {"type": "string"}, "description": "List of endpoint IDs to resume"},
+                        "tag": {"type": "string", "description": "Resume all endpoints with this tag"},
+                    },
+                },
+            ),
+            Tool(
+                name="bulk_endpoint_disable",
+                description="Disable multiple webhook endpoints at once. Specify endpoint_ids list and/or tag to select targets.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_ids": {"type": "array", "items": {"type": "string"}, "description": "List of endpoint IDs to disable"},
+                        "tag": {"type": "string", "description": "Disable all endpoints with this tag"},
+                    },
+                },
+            ),
+            Tool(
+                name="bulk_endpoint_delete",
+                description="Delete multiple webhook endpoints at once. Specify endpoint_ids list and/or tag to select targets.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_ids": {"type": "array", "items": {"type": "string"}, "description": "List of endpoint IDs to delete"},
+                        "tag": {"type": "string", "description": "Delete all endpoints with this tag"},
+                    },
+                },
+            ),
+            Tool(
+                name="delivery_simulate",
+                description="Simulate a webhook delivery without actually sending it. Shows what would be sent: URL, method, headers, HMAC signature, transformed payload, retry config, circuit breaker state.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Target endpoint ID"},
+                        "payload": {"type": "object", "description": "JSON payload to simulate"},
+                        "event_type": {"type": "string"},
+                        "headers": {"type": "object", "description": "Per-delivery headers"},
+                    },
+                    "required": ["endpoint_id", "payload"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -1216,6 +1421,176 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     restore_secrets=arguments.get("restore_secrets", False),
                 )
                 return [TextContent(type="text", text=json.dumps(summary, default=str, indent=2))]
+
+            elif name == "analytics_overview":
+                from .analytics import AnalyticsEngine
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                ae = AnalyticsEngine(svc)
+                report = ae.overall_report(limit=arguments.get("limit", 10000))
+                return [TextContent(type="text", text=json.dumps(report, default=str, indent=2))]
+
+            elif name == "analytics_endpoint":
+                from .analytics import AnalyticsEngine
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                ae = AnalyticsEngine(svc)
+                report = ae.endpoint_report(arguments["endpoint_id"])
+                if report is None:
+                    return [TextContent(type="text", text=f"Endpoint not found: {arguments['endpoint_id']}")]
+                return [TextContent(type="text", text=json.dumps(report, default=str, indent=2))]
+
+            elif name == "analytics_retry":
+                from .analytics import AnalyticsEngine
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                ae = AnalyticsEngine(svc)
+                report = ae.retry_analysis(limit=arguments.get("limit", 10000))
+                return [TextContent(type="text", text=json.dumps(report, default=str, indent=2))]
+
+            elif name == "template_list":
+                from .templates import TemplateRegistry
+                registry = TemplateRegistry()
+                tag = arguments.get("tag")
+                templates = registry.list_templates(tag=tag)
+                return [TextContent(type="text", text=json.dumps(templates, default=str, indent=2))]
+
+            elif name == "template_get":
+                from .templates import TemplateRegistry
+                registry = TemplateRegistry()
+                template = registry.get_template(arguments["key"])
+                if template is None:
+                    return [TextContent(type="text", text=f"Template not found: {arguments['key']}\nAvailable: {', '.join(registry.keys)}")]
+                return [TextContent(type="text", text=json.dumps(template.to_dict(), default=str, indent=2))]
+
+            elif name == "endpoint_from_template":
+                from .templates import TemplateRegistry
+                registry = TemplateRegistry()
+                endpoint_obj = registry.create_endpoint(
+                    key=arguments["key"],
+                    url=arguments["url"],
+                    name=arguments.get("name"),
+                    secret=arguments.get("secret"),
+                    description=arguments.get("description"),
+                    extra_headers=arguments.get("extra_headers"),
+                )
+                if endpoint_obj is None:
+                    return [TextContent(type="text", text=f"Template not found: {arguments['key']}\nAvailable: {', '.join(registry.keys)}")]
+                store.add_endpoint(endpoint_obj)
+                return [TextContent(type="text", text=json.dumps(endpoint_obj.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "webhook_schedule":
+                from datetime import datetime as _dt
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                scheduled_at = _dt.fromisoformat(arguments["scheduled_at"].replace("Z", "+00:00"))
+                delivery = svc.schedule_webhook(
+                    endpoint_id=arguments["endpoint_id"],
+                    payload=arguments["payload"],
+                    scheduled_at=scheduled_at,
+                    event_type=arguments.get("event_type"),
+                    metadata=arguments.get("metadata"),
+                    headers=arguments.get("headers"),
+                )
+                if delivery is None:
+                    return [TextContent(type="text", text=f"Endpoint not found: {arguments['endpoint_id']}")]
+                return [TextContent(type="text", text=json.dumps(delivery.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "recurring_schedule_create":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                schedule = svc.create_schedule(
+                    name=arguments["name"],
+                    endpoint_id=arguments["endpoint_id"],
+                    payload=arguments["payload"],
+                    interval_value=arguments["interval_value"],
+                    interval_unit=arguments.get("interval_unit", "minutes"),
+                    event_type=arguments.get("event_type"),
+                    headers=arguments.get("headers"),
+                    metadata=arguments.get("metadata"),
+                    max_runs=arguments.get("max_runs", 0),
+                )
+                if schedule is None:
+                    return [TextContent(type="text", text=f"Endpoint not found: {arguments['endpoint_id']}")]
+                return [TextContent(type="text", text=json.dumps(schedule.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "recurring_schedule_list":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                schedules = svc.list_schedules(
+                    endpoint_id=arguments.get("endpoint_id"),
+                    active_only=arguments.get("active_only", False),
+                )
+                return [TextContent(type="text", text=json.dumps([s.model_dump(mode="json") for s in schedules], default=str, indent=2))]
+
+            elif name == "recurring_schedule_pause":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                schedule = svc.pause_schedule(arguments["schedule_id"])
+                if schedule is None:
+                    return [TextContent(type="text", text=f"Schedule not found: {arguments['schedule_id']}")]
+                return [TextContent(type="text", text=json.dumps(schedule.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "recurring_schedule_resume":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                schedule = svc.resume_schedule(arguments["schedule_id"])
+                if schedule is None:
+                    return [TextContent(type="text", text=f"Schedule not found: {arguments['schedule_id']}")]
+                return [TextContent(type="text", text=json.dumps(schedule.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "recurring_schedule_delete":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                deleted = svc.delete_schedule(arguments["schedule_id"])
+                return [TextContent(type="text", text=json.dumps({"deleted": deleted, "schedule_id": arguments["schedule_id"]}))]
+
+            elif name == "bulk_endpoint_pause":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                paused = svc.bulk_pause(
+                    endpoint_ids=arguments.get("endpoint_ids"),
+                    tag=arguments.get("tag"),
+                )
+                return [TextContent(type="text", text=json.dumps({"paused_count": len(paused), "paused_endpoint_ids": paused}))]
+
+            elif name == "bulk_endpoint_resume":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                resumed = svc.bulk_resume(
+                    endpoint_ids=arguments.get("endpoint_ids"),
+                    tag=arguments.get("tag"),
+                )
+                return [TextContent(type="text", text=json.dumps({"resumed_count": len(resumed), "resumed_endpoint_ids": resumed}))]
+
+            elif name == "bulk_endpoint_disable":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                disabled = svc.bulk_disable(
+                    endpoint_ids=arguments.get("endpoint_ids"),
+                    tag=arguments.get("tag"),
+                )
+                return [TextContent(type="text", text=json.dumps({"disabled_count": len(disabled), "disabled_endpoint_ids": disabled}))]
+
+            elif name == "bulk_endpoint_delete":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                deleted = svc.bulk_delete(
+                    endpoint_ids=arguments.get("endpoint_ids"),
+                    tag=arguments.get("tag"),
+                )
+                return [TextContent(type="text", text=json.dumps({"deleted_count": len(deleted), "deleted_endpoint_ids": deleted}))]
+
+            elif name == "delivery_simulate":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                result = svc.simulate_delivery(
+                    endpoint_id=arguments["endpoint_id"],
+                    payload=arguments["payload"],
+                    event_type=arguments.get("event_type"),
+                    headers=arguments.get("headers"),
+                )
+                return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
 
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]

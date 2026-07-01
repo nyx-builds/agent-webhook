@@ -12,6 +12,9 @@ Built for the agentic economy — by [Nyx Builds](https://github.com/nyx-builds)
 - **Batch Delivery** — Send the same payload to multiple endpoints at once
 - **Event Subscriptions** — Subscribe endpoints to specific event types and broadcast to subscribers
 - **Delivery Cancellation** — Cancel pending or retrying deliveries
+- **Recurring Schedules** — Set up periodic webhook delivery (cron-like intervals) for heartbeats, polling, and check-ins. Configurable interval (seconds/minutes/hours/days), max-run limits, pause/resume, and auto-deactivation on exhaustion
+- **Bulk Endpoint Operations** — Mass pause, resume, disable, or delete endpoints by ID list or tag — essential for fleet management
+- **Dry-Run Simulation** — Preview exactly what would be sent (URL, method, headers, HMAC signature, transformed payload, retry policy) without making any HTTP request
 - **Dead Letter Queue** — Permanently failed deliveries are captured for inspection and replay
 - **Payload Transforms** — Rename, filter, or template webhook payloads before delivery
 - **Relay Filters** — Conditional forwarding rules based on headers and payload fields (equals, regex, numeric, list operators)
@@ -25,7 +28,7 @@ Built for the agentic economy — by [Nyx Builds](https://github.com/nyx-builds)
 - **Relay Server** — Forward incoming webhooks to registered endpoints using path-based routing rules
 - **REST API** — Optional FastAPI server for HTTP access to all operations
 - **Service Layer** — Clean business logic API on top of store and engine
-- **MCP Server** — 42 tools for full webhook management from any MCP-compatible agent
+- **MCP Server** — 46 tools for full webhook management from any MCP-compatible agent
 - **Rich CLI** — Beautiful terminal interface with tables, colors, and filtering
 - **SQLite Backend** — Default persistent storage with JSON-to-SQLite migration; JSON file backend also supported
 
@@ -191,7 +194,7 @@ Or configure in your MCP client:
 }
 ```
 
-### MCP Tools (42)
+### MCP Tools (46)
 
 | Tool | Description |
 |------|-------------|
@@ -243,6 +246,16 @@ Or configure in your MCP client:
 | `export_config` | Export configuration to portable format |
 | `import_config` | Import configuration with conflict strategies |
 | `migrate_json_to_sqlite` | Migrate JSON store to SQLite backend |
+| `recurring_schedule_create` | Create a recurring delivery schedule |
+| `recurring_schedule_list` | List recurring schedules |
+| `recurring_schedule_pause` | Pause a recurring schedule |
+| `recurring_schedule_resume` | Resume a paused schedule |
+| `recurring_schedule_delete` | Delete a recurring schedule |
+| `bulk_pause` | Bulk pause endpoints by IDs or tag |
+| `bulk_resume` | Bulk resume endpoints by IDs or tag |
+| `bulk_disable` | Bulk disable endpoints by IDs or tag |
+| `bulk_delete` | Bulk delete endpoints by IDs or tag |
+| `simulate_delivery` | Dry-run preview of what would be sent (no HTTP) |
 
 ## Python API
 
@@ -490,6 +503,14 @@ pytest tests/test_service.py -v
 ```
 
 ## Changelog
+
+### v0.6.0
+- **Recurring Schedules** — Periodic webhook delivery (cron-like intervals: seconds/minutes/hours/days) with configurable max-runs, pause/resume, start_at delay, auto-deactivation on exhaustion, and automatic worker integration
+- **Bulk Endpoint Operations** — Mass pause, resume, disable, and delete endpoints by ID list or tag — essential for fleet management
+- **Dry-Run Simulation** — Preview exactly what would be sent (URL, method, headers, HMAC signature, transformed payload, retry policy, rate limit) without making any HTTP request
+- **CLI** — New command groups: `schedule` (create/list/pause/resume/delete/show/fire), `bulk` (pause/resume/disable/delete), and `simulate`
+- **MCP Server** — Expanded from 42 to 46 tools (added recurring_schedule_*, bulk_*, simulate_delivery)
+- **Tests** — Expanded from 524 to 545 tests across 15 test files
 
 ### v0.5.0
 - **Circuit Breaker** — Per-endpoint automatic failure detection (CLOSED → OPEN → HALF_OPEN), configurable threshold/recovery, force-reset via CLI/MCP

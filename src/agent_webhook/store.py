@@ -16,6 +16,7 @@ from .models import (
     RelayRule,
     WebhookDelivery,
     WebhookEndpoint,
+    WebhookSchedule,
     WebhookStatus,
 )
 
@@ -33,6 +34,7 @@ class WebhookStore:
             "relay_rules": {},
             "subscriptions": {},
             "event_log": [],
+            "schedules": {},
         }
         self._load()
 
@@ -58,6 +60,9 @@ class WebhookStore:
             # Parse event log
             for edata in raw.get("event_log", []):
                 self._data["event_log"].append(EventLogEntry.model_validate(edata))
+            # Parse schedules
+            for sid, sdata in raw.get("schedules", {}).items():
+                self._data["schedules"][sid] = WebhookSchedule.model_validate(sdata)
 
     def _save(self) -> None:
         serializable = {
@@ -67,6 +72,7 @@ class WebhookStore:
             "relay_rules": {k: v.model_dump(mode="json") for k, v in self._data["relay_rules"].items()},
             "subscriptions": {k: v.model_dump(mode="json") for k, v in self._data["subscriptions"].items()},
             "event_log": [e.model_dump(mode="json") for e in self._data["event_log"]],
+            "schedules": {k: v.model_dump(mode="json") for k, v in self._data["schedules"].items()},
         }
         tmp = self._path.with_suffix(".tmp")
         with open(tmp, "w") as f:
@@ -347,7 +353,58 @@ class WebhookStore:
         result = []
         for d in self._data["deliveries"].values():
             if d.status == DeliveryStatus.PENDING:
+                # Skip scheduled deliveries that aren't due yet
+                if d.scheduled_at is not None and d.scheduled_at > now:
+                    continue
                 result.append(d)
             elif d.status == DeliveryStatus.RETRYING and (d.next_retry_at is None or d.next_retry_at <= now):
                 result.append(d)
         return sorted(result, key=lambda d: d.created_at)
+
+    # --- Schedules ---
+
+    def add_schedule(self, schedule: WebhookSchedule) -> WebhookSchedule:
+        with self._lock:
+            self._data["schedules"][schedule.id] = schedule
+            self._save()
+        return schedule
+
+    def get_schedule(self, schedule_id: str) -> WebhookSchedule | None:
+        return self._data["schedules"].get(schedule_id)
+
+    def list_schedules(
+        self,
+        endpoint_id: str | None = None,
+        active_only: bool = False,
+    ) -> list[WebhookSchedule]:
+        schedules = list(self._data["schedules"].values())
+        if endpoint_id is not None:
+            schedules = [s for s in schedules if s.endpoint_id == endpoint_id]
+        if active_only:
+            schedules = [s for s in schedules if s.active]
+        return sorted(schedules, key=lambda s: s.created_at)
+
+    def update_schedule(self, schedule_id: str, **updates: Any) -> WebhookSchedule | None:
+        with self._lock:
+            schedule = self._data["schedules"].get(schedule_id)
+            if schedule is None:
+                return None
+            for key, value in updates.items():
+                if hasattr(schedule, key):
+                    setattr(schedule, key, value)
+            from datetime import datetime, timezone
+            schedule.updated_at = datetime.now(timezone.utc)
+            self._save()
+        return schedule
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self._lock:
+            if schedule_id not in self._data["schedules"]:
+                return False
+            del self._data["schedules"][schedule_id]
+            self._save()
+        return True
+
+    def due_schedules(self) -> list[WebhookSchedule]:
+        """Get all active schedules that are due to run."""
+        return [s for s in self._data["schedules"].values() if s.is_due()]

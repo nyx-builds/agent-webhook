@@ -197,44 +197,51 @@ class CircuitBreaker:
             if state["state"] == CircuitState.HALF_OPEN:
                 state["half_open_calls"] += 1
 
+    def _compute_state_locked(self, endpoint_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        """Build the state dict. Must be called while holding ``self._lock``."""
+        current = state["state"]
+
+        # Auto-transition OPEN → HALF_OPEN for reporting if timeout elapsed
+        if current == CircuitState.OPEN and state["opened_at"] is not None:
+            elapsed = (datetime.now(timezone.utc) - state["opened_at"]).total_seconds()
+            if elapsed >= self._config.recovery_timeout:
+                state["state"] = CircuitState.HALF_OPEN
+                state["half_open_calls"] = 0
+                state["consecutive_successes"] = 0
+
+        # Calculate time remaining if OPEN
+        time_until_half_open = None
+        if state["state"] == CircuitState.OPEN and state["opened_at"] is not None:
+            elapsed = (datetime.now(timezone.utc) - state["opened_at"]).total_seconds()
+            time_until_half_open = max(0, self._config.recovery_timeout - elapsed)
+
+        return {
+            "endpoint_id": endpoint_id,
+            "state": state["state"].value,
+            "consecutive_failures": state["consecutive_failures"],
+            "consecutive_successes": state["consecutive_successes"],
+            "total_trips": state["total_trips"],
+            "opened_at": state["opened_at"],
+            "last_failure_at": state["last_failure_at"],
+            "last_success_at": state["last_success_at"],
+            "time_until_half_open_seconds": round(time_until_half_open, 1) if time_until_half_open is not None else None,
+            "half_open_calls": state["half_open_calls"],
+            "config": self._config.to_dict(),
+        }
+
     def get_state(self, endpoint_id: str) -> dict[str, Any]:
         """Get the current circuit breaker state for an endpoint."""
         with self._lock:
             state = self._get_or_init(endpoint_id)
-            current = state["state"]
-
-            # Auto-transition OPEN → HALF_OPEN for reporting if timeout elapsed
-            if current == CircuitState.OPEN and state["opened_at"] is not None:
-                elapsed = (datetime.now(timezone.utc) - state["opened_at"]).total_seconds()
-                if elapsed >= self._config.recovery_timeout:
-                    state["state"] = CircuitState.HALF_OPEN
-                    state["half_open_calls"] = 0
-                    state["consecutive_successes"] = 0
-
-            # Calculate time remaining if OPEN
-            time_until_half_open = None
-            if state["state"] == CircuitState.OPEN and state["opened_at"] is not None:
-                elapsed = (datetime.now(timezone.utc) - state["opened_at"]).total_seconds()
-                time_until_half_open = max(0, self._config.recovery_timeout - elapsed)
-
-            return {
-                "endpoint_id": endpoint_id,
-                "state": state["state"].value,
-                "consecutive_failures": state["consecutive_failures"],
-                "consecutive_successes": state["consecutive_successes"],
-                "total_trips": state["total_trips"],
-                "opened_at": state["opened_at"],
-                "last_failure_at": state["last_failure_at"],
-                "last_success_at": state["last_success_at"],
-                "time_until_half_open_seconds": round(time_until_half_open, 1) if time_until_half_open is not None else None,
-                "half_open_calls": state["half_open_calls"],
-                "config": self._config.to_dict(),
-            }
+            return self._compute_state_locked(endpoint_id, state)
 
     def get_all_states(self) -> list[dict[str, Any]]:
         """Get circuit breaker states for all tracked endpoints."""
         with self._lock:
-            return [self.get_state(eid) for eid in list(self._states.keys())]
+            return [
+                self._compute_state_locked(eid, self._get_or_init(eid))
+                for eid in list(self._states.keys())
+            ]
 
     def reset(self, endpoint_id: str) -> dict[str, Any]:
         """Reset the circuit breaker for an endpoint (force close)."""
@@ -250,7 +257,7 @@ class CircuitBreaker:
                     "last_success_at": None,
                     "total_trips": 0,
                 }
-            return self.get_state(endpoint_id)
+            return self._compute_state_locked(endpoint_id, self._get_or_init(endpoint_id))
 
     def reset_all(self) -> None:
         """Reset all circuit breakers."""

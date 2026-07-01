@@ -201,12 +201,19 @@ class WebhookDelivery(BaseModel):
     transformed_payload: dict[str, Any] | None = Field(default=None, description="Payload after transforms applied")
     dead_letter_reason: str | None = Field(default=None, description="Reason delivery went to dead letter queue")
     dead_lettered_at: datetime | None = Field(default=None, description="When delivery was moved to dead letter queue")
+    scheduled_at: datetime | None = Field(default=None, description="When this delivery should be processed (future scheduling)")
 
     def current_attempt_number(self) -> int:
         return len(self.attempts)
 
     def last_attempt(self) -> DeliveryAttempt | None:
         return self.attempts[-1] if self.attempts else None
+
+    def is_due(self) -> bool:
+        """Check if a scheduled delivery is ready to be processed."""
+        if self.scheduled_at is None:
+            return True
+        return datetime.now(timezone.utc) >= self.scheduled_at
 
     def can_retry(self, retry_policy: RetryPolicy) -> bool:
         if self.status in (DeliveryStatus.SUCCESS, DeliveryStatus.ABANDONED, DeliveryStatus.DEAD_LETTER):
@@ -327,3 +334,74 @@ class DeadLetterEntry(BaseModel):
     replayed: bool = False
     replayed_delivery_id: str | None = Field(default=None, description="ID of the replayed delivery")
     replayed_at: datetime | None = None
+
+
+class ScheduleInterval(str, Enum):
+    """Supported recurring schedule intervals."""
+    SECONDS = "seconds"
+    MINUTES = "minutes"
+    HOURS = "hours"
+    DAYS = "days"
+
+
+class WebhookSchedule(BaseModel):
+    """A recurring webhook delivery schedule.
+
+    Periodically sends a fixed payload to an endpoint at a specified interval.
+    Supports max_runs for finite schedules and can be paused/resumed.
+    """
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = Field(..., min_length=1, max_length=200, description="Human-readable schedule name")
+    endpoint_id: str = Field(..., description="Target endpoint ID")
+    payload: dict[str, Any] = Field(..., description="JSON payload to deliver on each run")
+    interval_value: int = Field(..., ge=1, description="Interval magnitude (e.g. 5 for every 5 minutes)")
+    interval_unit: ScheduleInterval = Field(default=ScheduleInterval.MINUTES, description="Interval unit")
+    event_type: str | None = Field(default=None, description="Event type tag for deliveries")
+    headers: dict[str, str] = Field(default_factory=dict, description="Per-delivery headers")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Extra metadata for deliveries")
+    active: bool = Field(default=True, description="Whether the schedule is active")
+    max_runs: int = Field(default=0, ge=0, description="Maximum number of runs (0 = unlimited)")
+    run_count: int = Field(default=0, ge=0, description="Number of times this schedule has fired")
+    next_run_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="When the next run should occur")
+    last_run_at: datetime | None = Field(default=None, description="When the last run occurred")
+    last_delivery_id: str | None = Field(default=None, description="ID of the last delivery created")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def interval_seconds(self) -> float:
+        """Convert interval to seconds."""
+        multipliers = {
+            ScheduleInterval.SECONDS: 1.0,
+            ScheduleInterval.MINUTES: 60.0,
+            ScheduleInterval.HOURS: 3600.0,
+            ScheduleInterval.DAYS: 86400.0,
+        }
+        return self.interval_value * multipliers[self.interval_unit]
+
+    def is_due(self, now: datetime | None = None) -> bool:
+        """Check if the schedule is due to run."""
+        if not self.active:
+            return False
+        if self.max_runs > 0 and self.run_count >= self.max_runs:
+            return False
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        # Handle naive next_run_at by treating it as UTC
+        next_run = self.next_run_at
+        if next_run.tzinfo is None:
+            next_run = next_run.replace(tzinfo=timezone.utc)
+        return now >= next_run
+
+    def is_exhausted(self) -> bool:
+        """Check if the schedule has reached its max_runs limit."""
+        return self.max_runs > 0 and self.run_count >= self.max_runs
+
+    def compute_next_run(self, base: datetime | None = None) -> datetime:
+        """Compute the next run time from a base datetime."""
+        from datetime import timedelta
+        base = base or datetime.now(timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        return base + timedelta(seconds=self.interval_seconds)
