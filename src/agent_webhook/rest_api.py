@@ -140,10 +140,20 @@ class GenerateSignatureRequest(PydanticModel):
 # ── App Factory ────────────────────────────────────────────────────
 
 
-def create_app(store_path: str = "webhook_store.db") -> FastAPI:
-    """Create the FastAPI application."""
+def create_app(
+    store_path: str = "webhook_store.db",
+    service: WebhookService | None = None,
+) -> FastAPI:
+    """Create the FastAPI application.
 
-    service = WebhookService(store_path=store_path)
+    Args:
+        store_path: Path to the store file (used if ``service`` is not given).
+        service: An existing ``WebhookService`` instance. If provided,
+            ``store_path`` is ignored.
+    """
+
+    if service is None:
+        service = WebhookService(store_path=store_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -153,7 +163,7 @@ def create_app(store_path: str = "webhook_store.db") -> FastAPI:
     app = FastAPI(
         title="Agent Webhook",
         description="Webhook management, delivery, and relay REST API for autonomous agents",
-        version="0.5.0",
+        version="0.7.0",
         lifespan=lifespan,
     )
 
@@ -169,7 +179,7 @@ def create_app(store_path: str = "webhook_store.db") -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "version": "0.5.0", "timestamp": datetime.now(timezone.utc).isoformat()}
+        return {"status": "ok", "version": "0.7.0", "timestamp": datetime.now(timezone.utc).isoformat()}
 
     # ── Endpoints ────────────────────────────────────────────────
 
@@ -689,5 +699,153 @@ def create_app(store_path: str = "webhook_store.db") -> FastAPI:
             restore_secrets=restore_secrets,
         )
         return summary
+
+    # ── Alerts ────────────────────────────────────────────────────────
+
+    @app.get("/alerts/summary")
+    async def alert_summary():
+        """Get alert summary — circuit breakers, DLQ count, stalled deliveries."""
+        from .alerts import AlertManager
+        manager = AlertManager(service)
+        # Evaluate defaults to get current state
+        from .alerts import default_alert_rules
+        for r in default_alert_rules():
+            manager.add_rule(r)
+        await manager.evaluate_all()
+        return manager.get_alert_summary()
+
+    @app.post("/alerts/evaluate")
+    async def alert_evaluate(req: dict = None):
+        """Evaluate alert rules and return fired events.
+
+        Request body (all optional):
+            condition: specific condition to evaluate
+            threshold: numeric threshold
+            severity: info/warning/critical
+            endpoint_id: scope to endpoint
+            tag: scope to tag
+            notify_endpoint_id: send notifications to this endpoint
+        """
+        from .alerts import (
+            AlertCondition,
+            AlertManager,
+            AlertRule,
+            AlertSeverity,
+            LogChannel,
+            WebhookChannel,
+            default_alert_rules,
+        )
+
+        req = req or {}
+        manager = AlertManager(service)
+
+        condition = req.get("condition")
+        if condition:
+            channels = [LogChannel()]
+            notify_ep = req.get("notify_endpoint_id")
+            if notify_ep:
+                channels.append(WebhookChannel(endpoint_id=notify_ep))
+
+            rule = AlertRule(
+                name=f"API-{condition}",
+                condition=AlertCondition(condition),
+                severity=AlertSeverity(req.get("severity", "warning")),
+                threshold=float(req.get("threshold", 0)),
+                endpoint_id=req.get("endpoint_id"),
+                tag=req.get("tag"),
+                channels=channels,
+            )
+            manager.add_rule(rule)
+        else:
+            for r in default_alert_rules(notify_endpoint_id=req.get("notify_endpoint_id")):
+                if req.get("endpoint_id"):
+                    r.endpoint_id = req["endpoint_id"]
+                if req.get("tag"):
+                    r.tag = req["tag"]
+                manager.add_rule(r)
+
+        events = await manager.evaluate_all()
+        return {
+            "evaluated": len(manager.rules),
+            "events": len(events),
+            "firing": [e.to_dict() for e in events if e.status.value == "firing"],
+            "resolved": [e.to_dict() for e in events if e.status.value == "resolved"],
+        }
+
+    # ── Retention ─────────────────────────────────────────────────────
+
+    @app.get("/retention/estimate")
+    async def retention_estimate(
+        delivery_days: int = Query(30, ge=0),
+        event_log_days: int = Query(90, ge=0),
+        dlq_days: int = Query(180, ge=0),
+        incoming_days: int = Query(7, ge=0),
+        keep_failed: bool = Query(False),
+    ):
+        """Preview how many records would be deleted by retention cleanup."""
+        from .retention import RetentionPolicy, RetentionManager
+        policy = RetentionPolicy(
+            delivery_retention_days=delivery_days,
+            delivery_keep_failed=keep_failed,
+            event_log_retention_days=event_log_days,
+            dead_letter_retention_days=dlq_days,
+            incoming_retention_days=incoming_days,
+        )
+        manager = RetentionManager(service, policy)
+        return manager.get_estimates()
+
+    @app.post("/retention/cleanup")
+    async def retention_cleanup(req: dict = None):
+        """Run data retention cleanup — deletes old records.
+
+        Request body (all optional, uses defaults if omitted):
+            delivery_retention_days: int (default 30)
+            delivery_keep_failed: bool (default false)
+            event_log_retention_days: int (default 90)
+            dead_letter_retention_days: int (default 180)
+            dead_letter_delete_replayed: bool (default true)
+            incoming_retention_days: int (default 7)
+            cleanup_batch_size: int (default 5000)
+            dry_run: bool (default false)
+        """
+        from .retention import RetentionPolicy, RetentionManager
+
+        req = req or {}
+        dry_run = req.get("dry_run", False)
+        policy_data = {k: v for k, v in req.items() if k != "dry_run"}
+        policy = RetentionPolicy.from_dict(policy_data) if policy_data else RetentionPolicy()
+
+        manager = RetentionManager(service, policy)
+
+        if dry_run:
+            return {"dry_run": True, **manager.get_estimates()}
+
+        result = manager.run_cleanup()
+        return result.to_dict()
+
+    # ── API Key Info ──────────────────────────────────────────────────
+
+    @app.post("/apikeys/generate")
+    async def generate_api_key(
+        name: str = Query(..., min_length=1),
+        scope: list[str] = Query(None),
+        expires_in: int = Query(None, ge=1),
+    ):
+        """Generate a new API key. Returns the raw key (shown only once)."""
+        from .auth import APIKeyManager
+        manager = APIKeyManager()
+        raw_key, key_info = manager.create_key(
+            name=name,
+            scopes=scope,
+            expires_in_seconds=expires_in,
+        )
+        return {
+            "key": raw_key,
+            "name": key_info.name,
+            "scopes": key_info.scopes,
+            "created_at": key_info.created_at,
+            "expires_at": key_info.expires_at,
+            "note": "Store this key securely. It will not be shown again.",
+        }
 
     return app

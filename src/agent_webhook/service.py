@@ -54,6 +54,10 @@ class WebhookService:
 
     # ── Endpoint Management ──────────────────────────────────────────
 
+    def add_endpoint(self, endpoint: WebhookEndpoint) -> WebhookEndpoint:
+        """Add a pre-constructed WebhookEndpoint to the store."""
+        return self._store.add_endpoint(endpoint)
+
     def create_endpoint(
         self,
         name: str,
@@ -142,6 +146,78 @@ class WebhookService:
         return self._store.delete_endpoint(endpoint_id)
 
     # ── Delivery Management ──────────────────────────────────────────
+
+    def create_delivery(
+        self,
+        endpoint_id: str,
+        payload: dict[str, Any],
+        event_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> WebhookDelivery | None:
+        """Create a delivery record in PENDING status without sending it.
+
+        Args:
+            endpoint_id: Target endpoint ID.
+            payload: JSON payload to deliver.
+            event_type: Optional event type tag.
+            metadata: Optional metadata.
+            headers: Optional per-delivery headers.
+
+        Returns:
+            The created ``WebhookDelivery``, or ``None`` if the endpoint
+            doesn't exist.
+        """
+        ep = self._store.get_endpoint(endpoint_id)
+        if ep is None:
+            return None
+        delivery = WebhookDelivery(
+            endpoint_id=endpoint_id,
+            payload=payload,
+            event_type=event_type,
+            metadata=metadata or {},
+            payload_headers=headers or {},
+        )
+        return self._store.add_delivery(delivery)
+
+    def add_to_dead_letter(
+        self,
+        endpoint_id: str,
+        payload: dict[str, Any],
+        error: str,
+        attempt_count: int = 0,
+        last_status_code: int | None = None,
+        event_type: str | None = None,
+        delivery_id: str | None = None,
+    ) -> DeadLetterEntry | None:
+        """Manually add an entry to the dead letter queue.
+
+        Args:
+            endpoint_id: Target endpoint ID.
+            payload: Original payload.
+            error: Error message / reason for dead-lettering.
+            attempt_count: Number of attempts made.
+            last_status_code: HTTP status code from last attempt.
+            event_type: Optional event type.
+            delivery_id: Original delivery ID (if applicable).
+
+        Returns:
+            The created ``DeadLetterEntry``, or ``None`` if the store
+            doesn't support dead letter operations.
+        """
+        if not hasattr(self._store, "add_dead_letter"):
+            return None
+        entry = DeadLetterEntry(
+            delivery_id=delivery_id or "",
+            endpoint_id=endpoint_id,
+            payload=payload,
+            event_type=event_type,
+            reason=error,
+            last_error=error,
+            last_status_code=last_status_code,
+            total_attempts=attempt_count,
+        )
+        return self._store.add_dead_letter(entry)
 
     async def send_webhook(
         self,

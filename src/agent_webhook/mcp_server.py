@@ -826,6 +826,74 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     "required": ["endpoint_id", "payload"],
                 },
             ),
+            Tool(
+                name="alert_evaluate",
+                description="Evaluate alert rules against current state. Checks circuit breakers, DLQ thresholds, failure rates, disabled endpoints, and stalled deliveries. Returns fired/resolved events.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "condition": {
+                            "type": "string",
+                            "enum": ["circuit_open", "dlq_threshold", "endpoint_failure_rate", "endpoint_down", "delivery_stalled"],
+                            "description": "Specific condition to evaluate. If omitted, evaluates all default rules.",
+                        },
+                        "threshold": {"type": "number", "description": "Threshold (count, percentage, or minutes depending on condition)"},
+                        "severity": {"type": "string", "enum": ["info", "warning", "critical"], "default": "warning"},
+                        "endpoint_id": {"type": "string", "description": "Scope alert to this endpoint"},
+                        "tag": {"type": "string", "description": "Scope alert to endpoints with this tag"},
+                        "notify_endpoint_id": {"type": "string", "description": "Endpoint ID to send alert notifications to"},
+                    },
+                },
+            ),
+            Tool(
+                name="alert_summary",
+                description="Get a quick alert summary — counts of open circuit breakers, DLQ entries, stalled deliveries, and active rules.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="retention_estimate",
+                description="Preview how many records would be deleted by a retention cleanup (dry run). Shows deliveries, event logs, DLQ, and incoming counts.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "delivery_days": {"type": "integer", "default": 30, "description": "Delivery retention in days"},
+                        "event_log_days": {"type": "integer", "default": 90, "description": "Event log retention in days"},
+                        "dlq_days": {"type": "integer", "default": 180, "description": "Dead letter retention in days"},
+                        "incoming_days": {"type": "integer", "default": 7, "description": "Incoming webhook retention in days"},
+                        "keep_failed": {"type": "boolean", "default": false, "description": "Don't count failed/dead-letter deliveries"},
+                    },
+                },
+            ),
+            Tool(
+                name="retention_cleanup",
+                description="Run data retention cleanup — permanently deletes old deliveries, event logs, dead letter entries, and incoming webhook records based on retention policy.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "delivery_retention_days": {"type": "integer", "default": 30},
+                        "delivery_keep_failed": {"type": "boolean", "default": false},
+                        "event_log_retention_days": {"type": "integer", "default": 90},
+                        "dead_letter_retention_days": {"type": "integer", "default": 180},
+                        "dead_letter_delete_replayed": {"type": "boolean", "default": true},
+                        "incoming_retention_days": {"type": "integer", "default": 7},
+                        "cleanup_batch_size": {"type": "integer", "default": 5000},
+                        "dry_run": {"type": "boolean", "default": false, "description": "Preview without deleting"},
+                    },
+                },
+            ),
+            Tool(
+                name="apikey_generate",
+                description="Generate a new API key for REST API authentication. Returns the raw key (shown only once) with name, scopes, and expiration.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Name/label for this key"},
+                        "scope": {"type": "array", "items": {"type": "string"}, "description": "Scopes (default: [*] = all)"},
+                        "expires_in": {"type": "integer", "description": "Expire in N seconds (optional)"},
+                    },
+                    "required": ["name"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -1590,6 +1658,108 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     event_type=arguments.get("event_type"),
                     headers=arguments.get("headers"),
                 )
+                return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
+
+            elif name == "alert_evaluate":
+                from .alerts import (
+                    AlertCondition,
+                    AlertManager,
+                    AlertRule,
+                    AlertSeverity,
+                    LogChannel,
+                    WebhookChannel,
+                    default_alert_rules,
+                )
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                manager = AlertManager(svc)
+
+                condition = arguments.get("condition")
+                if condition:
+                    channels = [LogChannel()]
+                    notify_ep = arguments.get("notify_endpoint_id")
+                    if notify_ep:
+                        channels.append(WebhookChannel(endpoint_id=notify_ep))
+                    rule = AlertRule(
+                        name=f"MCP-{condition}",
+                        condition=AlertCondition(condition),
+                        severity=AlertSeverity(arguments.get("severity", "warning")),
+                        threshold=arguments.get("threshold", 0),
+                        endpoint_id=arguments.get("endpoint_id"),
+                        tag=arguments.get("tag"),
+                        channels=channels,
+                    )
+                    manager.add_rule(rule)
+                else:
+                    for r in default_alert_rules(notify_endpoint_id=arguments.get("notify_endpoint_id")):
+                        if arguments.get("endpoint_id"):
+                            r.endpoint_id = arguments["endpoint_id"]
+                        if arguments.get("tag"):
+                            r.tag = arguments["tag"]
+                        manager.add_rule(r)
+
+                events = await manager.evaluate_all()
+                result = {
+                    "evaluated": len(manager.rules),
+                    "events": len(events),
+                    "firing": [e.to_dict() for e in events if e.status.value == "firing"],
+                    "resolved": [e.to_dict() for e in events if e.status.value == "resolved"],
+                }
+                return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
+
+            elif name == "alert_summary":
+                from .alerts import AlertManager, default_alert_rules
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                manager = AlertManager(svc)
+                for r in default_alert_rules():
+                    manager.add_rule(r)
+                await manager.evaluate_all()
+                return [TextContent(type="text", text=json.dumps(manager.get_alert_summary(), default=str, indent=2))]
+
+            elif name == "retention_estimate":
+                from .retention import RetentionPolicy, RetentionManager
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                policy = RetentionPolicy(
+                    delivery_retention_days=arguments.get("delivery_days", 30),
+                    delivery_keep_failed=arguments.get("keep_failed", False),
+                    event_log_retention_days=arguments.get("event_log_days", 90),
+                    dead_letter_retention_days=arguments.get("dlq_days", 180),
+                    incoming_retention_days=arguments.get("incoming_days", 7),
+                )
+                manager = RetentionManager(svc, policy)
+                return [TextContent(type="text", text=json.dumps(manager.get_estimates(), default=str, indent=2))]
+
+            elif name == "retention_cleanup":
+                from .retention import RetentionPolicy, RetentionManager
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                dry_run = arguments.get("dry_run", False)
+                policy_data = {k: v for k, v in arguments.items() if k != "dry_run"}
+                policy = RetentionPolicy.from_dict(policy_data) if policy_data else RetentionPolicy()
+                manager = RetentionManager(svc, policy)
+                if dry_run:
+                    result = {"dry_run": True, **manager.get_estimates()}
+                else:
+                    result = manager.run_cleanup().to_dict()
+                return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
+
+            elif name == "apikey_generate":
+                from .auth import APIKeyManager
+                manager = APIKeyManager()
+                raw_key, key_info = manager.create_key(
+                    name=arguments["name"],
+                    scopes=arguments.get("scope"),
+                    expires_in_seconds=arguments.get("expires_in"),
+                )
+                result = {
+                    "key": raw_key,
+                    "name": key_info.name,
+                    "scopes": key_info.scopes,
+                    "expires_at": key_info.expires_at,
+                    "note": "Store this key securely. It will not be shown again.",
+                }
                 return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
 
             else:

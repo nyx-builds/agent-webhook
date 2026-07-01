@@ -2327,5 +2327,344 @@ def simulate_cmd(
     console.print(f"\n[green]✓[/green] No HTTP request was made (dry run).")
 
 
+# ── Alert Commands ──────────────────────────────────────────────────
+
+
+@cli.group("alert")
+def alert_group() -> None:
+    """Alert rule management and evaluation."""
+    pass
+
+
+@alert_group.command("list-presets")
+def alert_list_presets() -> None:
+    """Show available preset alert conditions."""
+    from .alerts import AlertCondition, AlertSeverity
+
+    table = Table(title="Alert Conditions")
+    table.add_column("Condition", style="cyan")
+    table.add_column("Description")
+    table.add_column("Key Param")
+
+    descriptions = {
+        AlertCondition.CIRCUIT_OPEN: ("Circuit breaker is OPEN for an endpoint", "—"),
+        AlertCondition.DLQ_THRESHOLD: ("Dead letter queue count exceeds threshold", "--threshold N"),
+        AlertCondition.ENDPOINT_FAILURE_RATE: ("Failure rate exceeds percentage", "--threshold PCT"),
+        AlertCondition.ENDPOINT_DOWN: ("Endpoint has been disabled", "—"),
+        AlertCondition.DELIVERY_STALLED: ("Delivies stuck in PENDING/RETRYING too long", "--threshold MINUTES"),
+    }
+
+    for cond, (desc, param) in descriptions.items():
+        table.add_row(cond.value, desc, param)
+
+    console.print(table)
+    console.print(f"\nSeverities: {', '.join(s.value for s in AlertSeverity)}")
+
+
+@alert_group.command("evaluate")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.db",
+    help="Store file path",
+)
+@click.option(
+    "--condition",
+    type=click.Choice([c.value for c in __import__("agent_webhook.alerts", fromlist=["AlertCondition"]).AlertCondition]),
+    help="Only evaluate this condition",
+)
+@click.option(
+    "--threshold",
+    type=float,
+    default=None,
+    help="Threshold for the condition (count, percentage, or minutes)",
+)
+@click.option(
+    "--severity",
+    type=click.Choice(["info", "warning", "critical"]),
+    default="warning",
+)
+@click.option(
+    "--notify-endpoint",
+    default=None,
+    help="Endpoint ID to send alert notifications to",
+)
+@click.option(
+    "--endpoint-id",
+    default=None,
+    help="Scope alert to this endpoint only",
+)
+@click.option(
+    "--tag",
+    default=None,
+    help="Scope alert to endpoints with this tag",
+)
+def alert_evaluate(
+    store_path: str,
+    condition: str | None,
+    threshold: float | None,
+    severity: str,
+    notify_endpoint: str | None,
+    endpoint_id: str | None,
+    tag: str | None,
+) -> None:
+    """Evaluate alert rules against current store state.
+
+    If no --condition is given, evaluates the default preset rules.
+    Fires notifications for any triggered alerts.
+    """
+    import asyncio
+    from .alerts import (
+        AlertCondition,
+        AlertManager,
+        AlertRule,
+        AlertSeverity,
+        LogChannel,
+        WebhookChannel,
+        default_alert_rules,
+    )
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    manager = AlertManager(service)
+
+    if condition:
+        from .alerts import LogChannel, WebhookChannel
+        channels = [LogChannel()]
+        if notify_endpoint:
+            channels.append(WebhookChannel(endpoint_id=notify_endpoint))
+
+        rule = AlertRule(
+            name=f"CLI-{condition}",
+            condition=AlertCondition(condition),
+            severity=AlertSeverity(severity),
+            threshold=threshold or 0,
+            endpoint_id=endpoint_id,
+            tag=tag,
+            channels=channels,
+        )
+        manager.add_rule(rule)
+    else:
+        # Use default rules
+        rules = default_alert_rules(notify_endpoint_id=notify_endpoint)
+        for r in rules:
+            if endpoint_id:
+                r.endpoint_id = endpoint_id
+            if tag:
+                r.tag = tag
+            manager.add_rule(r)
+
+    events = asyncio.run(manager.evaluate_all())
+
+    if not events:
+        console.print("[green]✓[/green] No alerts triggered. All clear.")
+        return
+
+    table = Table(title=f"Alert Evaluation ({len(events)} event(s))")
+    table.add_column("Status", style="bold")
+    table.add_column("Severity", style="cyan")
+    table.add_column("Condition")
+    table.add_column("Message")
+    table.add_column("Timestamp")
+
+    for event in events:
+        color = "red" if event.status.value == "firing" else "green"
+        sev_color = {"critical": "red", "warning": "yellow", "info": "blue"}.get(
+            event.severity.value, "white"
+        )
+        table.add_row(
+            f"[{color}]{event.status.value.upper()}[/{color}]",
+            f"[{sev_color}]{event.severity.value}[/{sev_color}]",
+            event.condition.value,
+            event.message,
+            event.timestamp.strftime("%H:%M:%S"),
+        )
+
+    console.print(table)
+
+
+@alert_group.command("summary")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.db",
+    help="Store file path",
+)
+def alert_summary(store_path: str) -> None:
+    """Show alert summary (circuit breakers, DLQ size, stalled deliveries)."""
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+
+    # Circuit breakers
+    cb_states = service.get_all_circuit_breaker_states()
+    open_breakers = [cb for cb in cb_states if cb.get("state") == "open"]
+
+    # DLQ
+    dlq_count = service.dead_letter_count()
+
+    # Stalled deliveries
+    from .models import DeliveryStatus
+    pending = service.list_deliveries(status=DeliveryStatus.PENDING, limit=500)
+    retrying = service.list_deliveries(status=DeliveryStatus.RETRYING, limit=500)
+
+    console.print("[cyan]📊 Alert Summary[/cyan]\n")
+
+    if open_breakers:
+        console.print(f"[red]⚠ {len(open_breakers)} circuit breaker(s) OPEN:[/red]")
+        for cb in open_breakers:
+            console.print(f"   • {cb.get('endpoint_id', '?')[:12]} — {cb.get('state')}")
+    else:
+        console.print("[green]✓ No open circuit breakers[/green]")
+
+    if dlq_count > 0:
+        console.print(f"[red]⚠ Dead letter queue: {dlq_count} entries[/red]")
+    else:
+        console.print("[green]✓ Dead letter queue empty[/green]")
+
+    if pending or retrying:
+        console.print(f"[yellow]⏳ {len(pending)} pending, {len(retrying)} retrying deliveries[/yellow]")
+    else:
+        console.print("[green]✓ No pending/retrying deliveries[/green]")
+
+
+# ── Retention Commands ──────────────────────────────────────────────
+
+
+@cli.group("retention")
+def retention_group() -> None:
+    """Data retention and cleanup management."""
+    pass
+
+
+@retention_group.command("show")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.db",
+    help="Store file path",
+)
+def retention_show(store_path: str) -> None:
+    """Show current retention policy and estimated cleanup impact."""
+    from .retention import RetentionPolicy, RetentionManager
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    manager = RetentionManager(service)
+    policy = manager.policy
+
+    console.print("[cyan]🔧 Retention Policy[/cyan]\n")
+    console.print(f"  Delivery retention:       {policy.delivery_retention_days} days {'(keep failed)' if policy.delivery_keep_failed else ''}")
+    console.print(f"  Event log retention:      {policy.event_log_retention_days} days")
+    console.print(f"  Dead letter retention:    {policy.dead_letter_retention_days} days {'(+ replayed)' if policy.dead_letter_delete_replayed else ''}")
+    console.print(f"  Incoming retention:       {policy.incoming_retention_days} days")
+    console.print(f"  Cleanup batch size:       {policy.cleanup_batch_size}")
+
+    console.print("\n[cyan]📈 Estimated Cleanup Impact[/cyan]\n")
+    estimates = manager.get_estimates()
+    for key, val in estimates.items():
+        label = key.replace("_", " ").title()
+        color = "yellow" if val > 0 else "green"
+        console.print(f"  {label}: [{color}]{val}[/{color}]")
+
+    if manager.last_result:
+        console.print(f"\n[dim]Last cleanup: {manager.last_result.total_deleted} deleted at {manager.last_result.ran_at.strftime('%Y-%m-%d %H:%M')}[/dim]")
+
+
+@retention_group.command("run")
+@click.option(
+    "--store", "store_path",
+    envvar="WEBHOOK_STORE",
+    default="webhook_store.db",
+    help="Store file path",
+)
+@click.option("--delivery-days", type=int, default=30, help="Delivery retention in days")
+@click.option("--event-log-days", type=int, default=90, help="Event log retention in days")
+@click.option("--dlq-days", type=int, default=180, help="Dead letter retention in days")
+@click.option("--incoming-days", type=int, default=7, help="Incoming webhook retention in days")
+@click.option("--keep-failed", is_flag=True, help="Don't delete failed/dead-letter deliveries")
+@click.option("--dry-run", is_flag=True, help="Preview what would be deleted without deleting")
+def retention_run(
+    store_path: str,
+    delivery_days: int,
+    event_log_days: int,
+    dlq_days: int,
+    incoming_days: int,
+    keep_failed: bool,
+    dry_run: bool,
+) -> None:
+    """Run data retention cleanup — deletes old records.
+
+    Use --dry-run to preview without deleting.
+    """
+    from .retention import RetentionPolicy, RetentionManager
+    from .service import WebhookService
+
+    service = WebhookService(store_path=store_path)
+    policy = RetentionPolicy(
+        delivery_retention_days=delivery_days,
+        delivery_keep_failed=keep_failed,
+        event_log_retention_days=event_log_days,
+        dead_letter_retention_days=dlq_days,
+        incoming_retention_days=incoming_days,
+    )
+
+    if dry_run:
+        manager = RetentionManager(service, policy)
+        estimates = manager.get_estimates()
+        console.print("[cyan]🔍 Dry Run — nothing will be deleted[/cyan]\n")
+        for key, val in estimates.items():
+            label = key.replace("_", " ").title()
+            console.print(f"  {label}: {val}")
+        return
+
+    manager = RetentionManager(service, policy)
+    result = manager.run_cleanup()
+
+    console.print(f"[green]✓ Cleanup complete[/green]\n")
+    console.print(f"  Deliveries deleted:     {result.deleted_deliveries}")
+    console.print(f"  Event logs deleted:     {result.deleted_event_logs}")
+    console.print(f"  Dead letter deleted:    {result.deleted_dead_letter}")
+    console.print(f"  Incoming deleted:       {result.deleted_incoming}")
+    console.print(f"  [bold]Total deleted: {result.total_deleted}[/bold]")
+
+    if result.errors:
+        console.print(f"\n[red]⚠ Errors:[/red]")
+        for err in result.errors:
+            console.print(f"  • {err}")
+
+
+# ── API Key Management ──────────────────────────────────────────────
+
+
+@cli.group("apikey")
+def apikey_group() -> None:
+    """API key generation and management (for REST API auth)."""
+    pass
+
+
+@apikey_group.command("generate")
+@click.option("--name", required=True, help="Name/label for this key")
+@click.option("--scope", multiple=True, help="Scope (repeatable). Default: * (all)")
+@click.option("--expires-in", type=int, default=None, help="Expire in N seconds")
+def apikey_generate(name: str, scope: tuple[str, ...], expires_in: int | None) -> None:
+    """Generate a new API key for REST API authentication."""
+    from .auth import APIKeyManager
+
+    manager = APIKeyManager()
+    raw_key, key_info = manager.create_key(
+        name=name,
+        scopes=list(scope) if scope else None,
+        expires_in_seconds=expires_in,
+    )
+
+    console.print(f"[green]✓ API key generated[/green]\n")
+    console.print(f"  Name:      {key_info.name}")
+    console.print(f"  Scopes:    {', '.join(key_info.scopes)}")
+    console.print(f"  Key:       [bold yellow]{raw_key}[/bold yellow]")
+    console.print(f"\n[dim]Store this key securely — it won't be shown again.[/dim]")
+    console.print(f"[dim]Use it in the 'X-API-Key' header or 'Authorization: Bearer *** header.[/dim]")
+
+
 if __name__ == "__main__":
     cli()

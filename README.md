@@ -19,6 +19,9 @@ Built for the agentic economy — by [Nyx Builds](https://github.com/nyx-builds)
 - **Payload Transforms** — Rename, filter, or template webhook payloads before delivery
 - **Relay Filters** — Conditional forwarding rules based on headers and payload fields (equals, regex, numeric, list operators)
 - **Incoming Signature Verification** — Verify HMAC signatures from GitHub, Stripe, Slack, Shopify, or generic providers with replay-attack prevention
+- **Alert Rules** — Proactive alerting on circuit breaker opens, DLQ thresholds, endpoint failure rates, endpoint downs, and stalled deliveries — with webhook, log, and callback notification channels
+- **Data Retention** — Automatic cleanup of old deliveries, event logs, dead-letter entries, and incoming webhooks with configurable policies and dry-run preview
+- **API Key Authentication** — SHA-256 hashed API keys with scopes, expiration, and revocation for securing the REST API
 - **Rate Limiting** — Per-endpoint rate limits with burst capacity
 - **Prometheus Metrics** — Delivery counts, durations, rate-limit and dead-letter counters exposed via `/metrics`
 - **Import / Export** — Portable config export (secrets excluded by default) with skip/overwrite/rename conflict resolution
@@ -26,9 +29,12 @@ Built for the agentic economy — by [Nyx Builds](https://github.com/nyx-builds)
 - **Event Audit Log** — Timestamped log of all webhook events for audit trails
 - **Delivery Tracking** — Full execution history with status codes, response bodies, and timing
 - **Relay Server** — Forward incoming webhooks to registered endpoints using path-based routing rules
+- **Webhook Templates** — Pre-configured endpoint templates for common services (Slack, Discord, generic JSON, etc.)
+- **Analytics Dashboard** — Endpoint health scoring, duration stats, failure patterns, and retry analytics
+- **Background Worker Pool** — Async worker pool for processing deliveries, schedules, and retries in the background
 - **REST API** — Optional FastAPI server for HTTP access to all operations
 - **Service Layer** — Clean business logic API on top of store and engine
-- **MCP Server** — 46 tools for full webhook management from any MCP-compatible agent
+- **MCP Server** — 70 tools for full webhook management from any MCP-compatible agent
 - **Rich CLI** — Beautiful terminal interface with tables, colors, and filtering
 - **SQLite Backend** — Default persistent storage with JSON-to-SQLite migration; JSON file backend also supported
 
@@ -194,7 +200,7 @@ Or configure in your MCP client:
 }
 ```
 
-### MCP Tools (46)
+### MCP Tools (70)
 
 | Tool | Description |
 |------|-------------|
@@ -203,12 +209,15 @@ Or configure in your MCP client:
 | `endpoint_get` | Get endpoint details |
 | `endpoint_update` | Update an endpoint |
 | `endpoint_delete` | Delete an endpoint |
+| `endpoint_from_template` | Create endpoint from a pre-configured template |
 | `webhook_send` | Send a webhook delivery |
 | `webhook_batch_send` | Send a payload to multiple endpoints |
+| `webhook_schedule` | Schedule a delivery for a future time |
 | `delivery_list` | List deliveries |
 | `delivery_get` | Get delivery details with attempts |
 | `delivery_retry` | Retry a failed delivery |
 | `delivery_cancel` | Cancel a pending/retrying delivery |
+| `delivery_simulate` | Dry-run preview of what would be sent (no HTTP) |
 | `process_pending` | Process all pending deliveries |
 | `health_check` | Test endpoint connectivity |
 | `stats` | Get delivery statistics |
@@ -251,11 +260,20 @@ Or configure in your MCP client:
 | `recurring_schedule_pause` | Pause a recurring schedule |
 | `recurring_schedule_resume` | Resume a paused schedule |
 | `recurring_schedule_delete` | Delete a recurring schedule |
-| `bulk_pause` | Bulk pause endpoints by IDs or tag |
-| `bulk_resume` | Bulk resume endpoints by IDs or tag |
-| `bulk_disable` | Bulk disable endpoints by IDs or tag |
-| `bulk_delete` | Bulk delete endpoints by IDs or tag |
-| `simulate_delivery` | Dry-run preview of what would be sent (no HTTP) |
+| `bulk_endpoint_pause` | Bulk pause endpoints by IDs or tag |
+| `bulk_endpoint_resume` | Bulk resume endpoints by IDs or tag |
+| `bulk_endpoint_disable` | Bulk disable endpoints by IDs or tag |
+| `bulk_endpoint_delete` | Bulk delete endpoints by IDs or tag |
+| `template_list` | List available webhook templates |
+| `template_get` | Get template details |
+| `analytics_overview` | Analytics dashboard: global health, top endpoints |
+| `analytics_endpoint` | Per-endpoint analytics: health score, duration stats |
+| `analytics_retry` | Retry analytics: success rates, avg attempts |
+| `alert_summary` | Alert state summary (rules, firing, resolved) |
+| `alert_evaluate` | Evaluate alert rules and get fired events |
+| `retention_estimate` | Preview retention cleanup impact (dry run) |
+| `retention_cleanup` | Run data retention cleanup |
+| `apikey_generate` | Generate a new API key with optional scopes/expiry |
 
 ## Python API
 
@@ -503,6 +521,14 @@ pytest tests/test_service.py -v
 ```
 
 ## Changelog
+
+### v0.7.0
+- **Alert Rules** — Proactive alerting system with 5 condition types (circuit_open, dlq_threshold, endpoint_failure_rate, endpoint_down, delivery_stalled), cooldown periods to prevent alert fatigue, and 3 notification channels (LogChannel for audit log, WebhookChannel for forwarding, CallbackChannel for custom handlers). Preset default rules and custom rule creation. REST API: `/alerts/summary`, `/alerts/evaluate`. CLI: `alert list-presets`, `alert summary`, `alert evaluate`. MCP tools: `alert_summary`, `alert_evaluate`.
+- **Data Retention** — Automatic cleanup of old deliveries, event log entries, dead-letter entries, and incoming webhooks. Configurable per-type retention windows, keep-failed option, batch-size limits, dry-run preview estimates. REST API: `/retention/estimate`, `/retention/cleanup`. CLI: `retention show`, `retention run`. MCP tools: `retention_estimate`, `retention_cleanup`.
+- **API Key Authentication** — SHA-256 hashed API keys with scopes (`*` wildcard or specific), expiration timestamps, and revocation. FastAPI middleware for `X-API-Key`, `Authorization: Bearer`, and `?api_key=` query param. REST API: `/apikeys/generate`. CLI: `apikey generate`. MCP tool: `apikey_generate`.
+- **Bug Fixes** — Fixed `AlertRule.id` uniqueness (UUID instead of name-derived slug), fixed `AlertRule` default channels (auto-attach LogChannel), fixed `APIKey.is_valid` as property, fixed `create_app()` to accept `service=` parameter, fixed DLQ cleanup with 0-day retention, aligned `__init__.py` version with pyproject.toml.
+- **Documentation** — Updated README with 70 MCP tools (was 46), added v0.7.0 features and changelog.
+- **Tests** — Fixed all 14 v0.7.0 test failures + 8 errors. 612 tests passing.
 
 ### v0.6.0
 - **Recurring Schedules** — Periodic webhook delivery (cron-like intervals: seconds/minutes/hours/days) with configurable max-runs, pause/resume, start_at delay, auto-deactivation on exhaustion, and automatic worker integration
