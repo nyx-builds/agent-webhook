@@ -210,15 +210,22 @@ class RetentionManager:
         # SQLite store — use SQL for efficiency
         if hasattr(store, "_get_conn"):
             conn = store._get_conn()
-            query = "DELETE FROM deliveries WHERE created_at < ?"
+            base_where = "created_at < ?"
             params: list[Any] = [cutoff.isoformat()]
 
             if self._policy.delivery_keep_failed:
                 # Keep failed and dead_letter statuses
-                query += " AND status NOT IN ('failed', 'dead_letter', 'retrying')"
+                base_where += " AND status NOT IN ('failed', 'dead_letter', 'retrying')"
 
             if self._policy.cleanup_batch_size > 0:
-                query += f" LIMIT {int(self._policy.cleanup_batch_size)}"
+                # SQLite doesn't support DELETE ... LIMIT; use subquery
+                query = (
+                    f"DELETE FROM deliveries WHERE id IN "
+                    f"(SELECT id FROM deliveries WHERE {base_where} "
+                    f"LIMIT {int(self._policy.cleanup_batch_size)})"
+                )
+            else:
+                query = f"DELETE FROM deliveries WHERE {base_where}"
 
             cursor = conn.execute(query, params)
             conn.commit()
@@ -261,7 +268,13 @@ class RetentionManager:
             query = "DELETE FROM event_log WHERE timestamp < ?"
             params: list[Any] = [cutoff.isoformat()]
             if self._policy.cleanup_batch_size > 0:
-                query += f" LIMIT {int(self._policy.cleanup_batch_size)}"
+                # SQLite doesn't support DELETE ... LIMIT; use subquery
+                query = (
+                    f"DELETE FROM event_log WHERE id IN "
+                    f"(SELECT id FROM event_log WHERE timestamp < ? "
+                    f"LIMIT {int(self._policy.cleanup_batch_size)})"
+                )
+                params = [cutoff.isoformat()]
             cursor = conn.execute(query, params)
             conn.commit()
             deleted = cursor.rowcount
@@ -333,7 +346,13 @@ class RetentionManager:
             query = "DELETE FROM incoming WHERE received_at < ?"
             params: list[Any] = [cutoff.isoformat()]
             if self._policy.cleanup_batch_size > 0:
-                query += f" LIMIT {int(self._policy.cleanup_batch_size)}"
+                # SQLite doesn't support DELETE ... LIMIT; use subquery
+                query = (
+                    f"DELETE FROM incoming WHERE id IN "
+                    f"(SELECT id FROM incoming WHERE received_at < ? "
+                    f"LIMIT {int(self._policy.cleanup_batch_size)})"
+                )
+                params = [cutoff.isoformat()]
             cursor = conn.execute(query, params)
             conn.commit()
             deleted = cursor.rowcount
