@@ -14,3 +14,7 @@ check_sqlite.py
 test_check.json
 *_store.json
 *_store.db
+
+# Coverage
+.coverage
+htmlcov/
