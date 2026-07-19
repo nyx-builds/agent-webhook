@@ -6,7 +6,8 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests: 545](https://img.shields.io/badge/tests-545%20passing-brightgreen.svg)](#testing)
+[![CI](https://github.com/nyx-builds/agent-webhook/actions/workflows/ci.yml/badge.svg)](https://github.com/nyx-builds/agent-webhook/actions/workflows/ci.yml)
+[![Tests: 612](https://img.shields.io/badge/tests-612%20passing-brightgreen.svg)](#testing)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed)](https://modelcontextprotocol.io)
 [![Version: 0.7.0](https://img.shields.io/badge/version-0.7.0-blue.svg)](#changelog)
 
