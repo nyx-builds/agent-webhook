@@ -53,21 +53,81 @@ class RateLimitPeriod(str, Enum):
     HOUR = "hour"
 
 
+class JitterType(str, Enum):
+    """Jitter strategy for retry backoff.
+
+    - **none**: No jitter. Pure exponential backoff.
+      (High thundering-herd risk on shared downstream outages.)
+    - **full**: Full jitter. Delay = random(0, exponential_delay).
+      (Recommended by AWS Architecture Blog — maximizes spread.)
+    - **equal**: Equal jitter. Delay = exponential_delay/2 + random(0, exponential_delay/2).
+      (Preserves minimum delay while capping variance.)
+    - **decorrelated**: Decorrelated jitter. Uses previous delay as the base for random range.
+      (Best for large retry counts — prevents tight retry storms.)
+    """
+    NONE = "none"
+    FULL = "full"
+    EQUAL = "equal"
+    DECORRELATED = "decorrelated"
+
+
 class RetryPolicy(BaseModel):
-    """Retry policy for failed webhook deliveries."""
+    """Retry policy for failed webhook deliveries.
+
+    Supports exponential backoff with configurable jitter strategies
+    to prevent thundering-herd retries when downstream services recover
+    from an outage.
+    """
     max_retries: int = Field(default=3, ge=0, le=10, description="Maximum number of retry attempts")
     initial_delay_seconds: float = Field(default=1.0, ge=0.1, description="Initial delay before first retry")
     max_delay_seconds: float = Field(default=300.0, ge=1.0, description="Maximum delay between retries")
     backoff_multiplier: float = Field(default=2.0, ge=1.0, description="Exponential backoff multiplier")
+    jitter: JitterType = Field(default=JitterType.FULL, description="Jitter strategy to apply to retry delays")
     retry_on_status_codes: list[int] = Field(
         default=[408, 429, 500, 502, 503, 504],
         description="HTTP status codes that trigger a retry",
     )
 
-    def delay_for_attempt(self, attempt: int) -> float:
-        """Calculate delay in seconds for a given retry attempt (0-indexed)."""
+    def base_delay_for_attempt(self, attempt: int) -> float:
+        """Calculate the *un-jittered* delay in seconds for a given retry attempt (0-indexed)."""
         delay = self.initial_delay_seconds * (self.backoff_multiplier ** attempt)
         return min(delay, self.max_delay_seconds)
+
+    def delay_for_attempt(self, attempt: int, prev_delay: float | None = None) -> float:
+        """Calculate the jittered delay in seconds for a given retry attempt.
+
+        For ``decorrelated`` jitter, pass the previous delay returned by this
+        method (or ``None`` for the first attempt).
+
+        Args:
+            attempt: Retry attempt number (0-indexed).
+            prev_delay: Previous jittered delay (only used for ``decorrelated`` jitter).
+
+        Returns:
+            Delay in seconds, clamped to ``[0, max_delay_seconds]``.
+        """
+        import random
+
+        base = self.base_delay_for_attempt(attempt)
+
+        if self.jitter == JitterType.NONE:
+            return base
+
+        if self.jitter == JitterType.FULL:
+            # Full jitter: uniform [0, base]
+            return random.uniform(0, base)
+
+        if self.jitter == JitterType.EQUAL:
+            # Equal jitter: base/2 + uniform(0, base/2)
+            return base / 2 + random.uniform(0, base / 2)
+
+        if self.jitter == JitterType.DECORRELATED:
+            # Decorrelated jitter: uniform [initial, min(max, prev * multiplier)]
+            prev = prev_delay if prev_delay is not None else self.initial_delay_seconds
+            cap = min(self.max_delay_seconds, prev * self.backoff_multiplier)
+            return random.uniform(self.initial_delay_seconds, cap)
+
+        return base  # Fallback (shouldn't reach here)
 
 
 class Header(BaseModel):
@@ -151,6 +211,17 @@ class WebhookEndpoint(BaseModel):
         default=None,
         description="Circuit breaker config: {failure_threshold, recovery_timeout, half_open_max_calls, success_threshold}",
     )
+    timestamped_signatures: bool = Field(
+        default=False,
+        description="When True, outbound HMAC signatures include a timestamp and nonce "
+        "for replay protection. Format: 't=<unix_ts>,v1=<hmac>'. "
+        "The signed message is '<timestamp>.<payload>'.",
+    )
+    idempotency_keys: bool = Field(
+        default=False,
+        description="When True, automatically generate an Idempotency-Key header (UUID) "
+        "for each delivery so receivers can safely deduplicate redeliveries.",
+    )
 
     @field_validator("url")
     @classmethod
@@ -202,6 +273,12 @@ class WebhookDelivery(BaseModel):
     dead_letter_reason: str | None = Field(default=None, description="Reason delivery went to dead letter queue")
     dead_lettered_at: datetime | None = Field(default=None, description="When delivery was moved to dead letter queue")
     scheduled_at: datetime | None = Field(default=None, description="When this delivery should be processed (future scheduling)")
+    idempotency_key: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Idempotency key sent as Idempotency-Key header. "
+        "When set, the receiver can safely deduplicate redeliveries.",
+    )
 
     def current_attempt_number(self) -> int:
         return len(self.attempts)

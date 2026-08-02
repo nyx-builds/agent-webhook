@@ -75,6 +75,9 @@ class WebhookService:
         retry_on_status_codes: list[int] | None = None,
         transform_ids: list[str] | None = None,
         rate_limit: dict[str, Any] | None = None,
+        jitter: str = "full",
+        timestamped_signatures: bool = False,
+        idempotency_keys: bool = False,
     ) -> WebhookEndpoint:
         """Create and register a new webhook endpoint."""
         header_objs = [Header(name=k, value=v) for k, v in (headers or {}).items()]
@@ -84,6 +87,7 @@ class WebhookService:
             "initial_delay_seconds": initial_delay_seconds,
             "max_delay_seconds": max_delay_seconds,
             "backoff_multiplier": backoff_multiplier,
+            "jitter": jitter,
         }
         if retry_on_status_codes is not None:
             retry_policy_kwargs["retry_on_status_codes"] = retry_on_status_codes
@@ -109,6 +113,8 @@ class WebhookService:
             retry_policy=retry_policy,
             transform_ids=transform_ids or [],
             rate_limit=rate_limit_obj,
+            timestamped_signatures=timestamped_signatures,
+            idempotency_keys=idempotency_keys,
         )
         return self._store.add_endpoint(endpoint)
 
@@ -154,6 +160,7 @@ class WebhookService:
         event_type: str | None = None,
         metadata: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
     ) -> WebhookDelivery | None:
         """Create a delivery record in PENDING status without sending it.
 
@@ -163,6 +170,9 @@ class WebhookService:
             event_type: Optional event type tag.
             metadata: Optional metadata.
             headers: Optional per-delivery headers.
+            idempotency_key: Optional idempotency key (sent as Idempotency-Key header).
+                If the endpoint has ``idempotency_keys=True`` and this is None,
+                one will be auto-generated at delivery time.
 
         Returns:
             The created ``WebhookDelivery``, or ``None`` if the endpoint
@@ -177,6 +187,7 @@ class WebhookService:
             event_type=event_type,
             metadata=metadata or {},
             payload_headers=headers or {},
+            idempotency_key=idempotency_key,
         )
         return self._store.add_delivery(delivery)
 
@@ -226,6 +237,7 @@ class WebhookService:
         event_type: str | None = None,
         metadata: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
     ) -> WebhookDelivery:
         """Send a webhook delivery to an endpoint."""
         return await self._engine.send(
@@ -234,6 +246,7 @@ class WebhookService:
             event_type=event_type,
             metadata=metadata or {},
             headers=headers or {},
+            idempotency_key=idempotency_key,
         )
 
     def schedule_webhook(
@@ -730,6 +743,32 @@ class WebhookService:
         verifier = SignatureVerifier()
         return verifier.detect_provider(headers)
 
+    def verify_outbound_signature(
+        self,
+        secret: str,
+        payload: str,
+        signature_header: str,
+        tolerance_seconds: int = 300,
+    ) -> dict[str, Any]:
+        """Verify a timestamped outbound HMAC signature.
+
+        This is the counterpart to ``timestamped_signatures=True`` on endpoints.
+        Receivers of our outbound webhooks can use this (or implement the same
+        algorithm) to verify that a delivery is authentic and not a replay.
+
+        Returns:
+            Dict with ``valid`` (bool) and ``error`` (str, if invalid).
+        """
+        valid = self._engine.verify_timestamped_signature(
+            secret=secret,
+            payload=payload,
+            signature_header=signature_header,
+            tolerance_seconds=tolerance_seconds,
+        )
+        if valid:
+            return {"valid": True}
+        return {"valid": False, "error": "Signature verification failed (invalid HMAC or timestamp outside tolerance)"}
+
     # ── Recurring Schedules ──────────────────────────────────────────
 
     def create_schedule(
@@ -955,9 +994,14 @@ class WebhookService:
         # Compute signature if secret configured
         signature = None
         if ep.secret:
-            signature = self._engine.generate_hmac_signature(
-                ep.secret, payload_str, algorithm=ep.signing_algorithm.value
-            )
+            if ep.timestamped_signatures:
+                signature, ts = self._engine.generate_timestamped_signature(
+                    ep.secret, payload_str, algorithm=ep.signing_algorithm.value
+                )
+            else:
+                signature = self._engine.generate_hmac_signature(
+                    ep.secret, payload_str, algorithm=ep.signing_algorithm.value
+                )
 
         # Build the headers that would be sent
         delivery_headers = self._engine.build_headers(ep, delivery, signature)
@@ -987,6 +1031,8 @@ class WebhookService:
             "rate_limit": ep.rate_limit.model_dump() if ep.rate_limit else None,
             "circuit_breaker_enabled": ep.circuit_breaker_enabled,
             "circuit_breaker_state": self._engine.get_circuit_breaker_state(endpoint_id),
+            "timestamped_signatures": ep.timestamped_signatures,
+            "idempotency_keys_enabled": ep.idempotency_keys,
             "estimated_delivery": "No HTTP request made (dry run)",
         }
 

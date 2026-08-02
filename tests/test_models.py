@@ -27,16 +27,26 @@ class TestRetryPolicy:
         assert policy.initial_delay_seconds == 1.0
         assert policy.max_delay_seconds == 300.0
         assert policy.backoff_multiplier == 2.0
+        assert policy.jitter.value == "full"  # default jitter
 
-    def test_delay_for_attempt(self):
-        policy = RetryPolicy(initial_delay_seconds=1.0, backoff_multiplier=2.0)
+    def test_base_delay_for_attempt(self):
+        """Base (un-jittered) delay follows pure exponential backoff."""
+        policy = RetryPolicy(initial_delay_seconds=1.0, backoff_multiplier=2.0, jitter="none")
+        assert policy.base_delay_for_attempt(0) == 1.0
+        assert policy.base_delay_for_attempt(1) == 2.0
+        assert policy.base_delay_for_attempt(2) == 4.0
+        assert policy.base_delay_for_attempt(3) == 8.0
+
+    def test_delay_for_attempt_no_jitter(self):
+        """With jitter=none, delay matches base delay exactly."""
+        policy = RetryPolicy(initial_delay_seconds=1.0, backoff_multiplier=2.0, jitter="none")
         assert policy.delay_for_attempt(0) == 1.0
         assert policy.delay_for_attempt(1) == 2.0
         assert policy.delay_for_attempt(2) == 4.0
         assert policy.delay_for_attempt(3) == 8.0
 
     def test_delay_capped_at_max(self):
-        policy = RetryPolicy(initial_delay_seconds=1.0, max_delay_seconds=5.0, backoff_multiplier=10.0)
+        policy = RetryPolicy(initial_delay_seconds=1.0, max_delay_seconds=5.0, backoff_multiplier=10.0, jitter="none")
         assert policy.delay_for_attempt(0) == 1.0
         assert policy.delay_for_attempt(1) == 5.0  # capped
         assert policy.delay_for_attempt(5) == 5.0  # still capped

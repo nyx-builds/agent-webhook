@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -87,6 +88,77 @@ class DeliveryEngine:
         return f"{algorithm}={digest.hexdigest()}"
 
     @staticmethod
+    def generate_timestamped_signature(secret: str, payload: str, algorithm: str = "sha256") -> tuple[str, int]:
+        """Generate a timestamped HMAC signature for replay protection.
+
+        The signed message is ``<timestamp>.<payload>``, and the returned
+        signature string follows the Stripe convention:
+
+            ``t=<unix_ts>,v1=<hex_hmac>``
+
+        Receivers verify by:
+        1. Extracting ``t`` and checking it's within their tolerance window.
+        2. Recomputing HMAC over ``t.payload`` and comparing to ``v1``.
+
+        Returns:
+            A tuple of ``(signature_header_value, timestamp_int)``.
+        """
+        ts = int(time.time())
+        signed_message = f"{ts}.{payload}"
+        if algorithm == "sha256":
+            digest = hmac.new(secret.encode(), signed_message.encode(), hashlib.sha256)
+        elif algorithm == "sha512":
+            digest = hmac.new(secret.encode(), signed_message.encode(), hashlib.sha512)
+        elif algorithm == "sha1":
+            digest = hmac.new(secret.encode(), signed_message.encode(), hashlib.sha1)
+        else:
+            raise ValueError(f"Unsupported algorithm: {algorithm}")
+        return f"t={ts},v1={digest.hexdigest()}", ts
+
+    @staticmethod
+    def verify_timestamped_signature(
+        secret: str,
+        payload: str,
+        signature_header: str,
+        tolerance_seconds: int = 300,
+    ) -> bool:
+        """Verify a timestamped HMAC signature.
+
+        Args:
+            secret: The shared secret.
+            payload: The raw payload string that was signed.
+            signature_header: The signature header value (``t=<ts>,v1=<hmac>``).
+            tolerance_seconds: Maximum age of the signature in seconds.
+
+        Returns:
+            True if the signature is valid and within tolerance.
+        """
+        try:
+            parts = dict(p.split("=", 1) for p in signature_header.split(","))
+            ts_str = parts.get("t")
+            v1 = parts.get("v1")
+            if ts_str is None or v1 is None:
+                return False
+            ts = int(ts_str)
+        except (ValueError, AttributeError):
+            return False
+
+        # Check timestamp tolerance (replay protection)
+        now = int(time.time())
+        if abs(now - ts) > tolerance_seconds:
+            return False
+
+        # Recompute HMAC
+        signed_message = f"{ts}.{payload}"
+        expected = hmac.new(
+            secret.encode(),
+            signed_message.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+        return hmac.compare_digest(expected, v1)
+
+    @staticmethod
     def build_headers(
         endpoint: WebhookEndpoint,
         delivery: WebhookDelivery,
@@ -95,13 +167,16 @@ class DeliveryEngine:
         """Build headers for a webhook delivery."""
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "agent-webhook/0.7.0",
+            "User-Agent": "agent-webhook/0.8.0",
             "X-Webhook-ID": delivery.id,
             "X-Webhook-Event": delivery.event_type or "generic",
             "X-Webhook-Timestamp": datetime.now(timezone.utc).isoformat(),
         }
         if signature:
             headers["X-Webhook-Signature"] = signature
+        # Add idempotency key if the delivery has one
+        if delivery.idempotency_key:
+            headers["Idempotency-Key"] = delivery.idempotency_key
         # Add endpoint-level custom headers
         for h in endpoint.headers:
             headers[h.name] = h.value
@@ -227,10 +302,22 @@ class DeliveryEngine:
 
         payload_str = json.dumps(transformed_payload, default=str)
 
+        # Auto-generate idempotency key if endpoint has it enabled
+        if endpoint.idempotency_keys and not delivery.idempotency_key:
+            delivery.idempotency_key = str(uuid.uuid4())
+            self._store.update_delivery(delivery.id, idempotency_key=delivery.idempotency_key)
+
         # Generate HMAC signature if secret is configured
         signature = None
         if endpoint.secret:
-            signature = self.generate_hmac_signature(endpoint.secret, payload_str, algorithm=endpoint.signing_algorithm.value)
+            if endpoint.timestamped_signatures:
+                signature, _ = self.generate_timestamped_signature(
+                    endpoint.secret, payload_str, algorithm=endpoint.signing_algorithm.value,
+                )
+            else:
+                signature = self.generate_hmac_signature(
+                    endpoint.secret, payload_str, algorithm=endpoint.signing_algorithm.value,
+                )
 
         headers = self.build_headers(endpoint, delivery, signature)
 
@@ -352,7 +439,15 @@ class DeliveryEngine:
             # Check if we can retry
             retry_policy = endpoint.retry_policy
             if delivery.can_retry(retry_policy):
-                delay = retry_policy.delay_for_attempt(attempt.attempt_number)
+                # Track previous delay for decorrelated jitter across retries.
+                # We store it in the delivery metadata so it persists between attempts.
+                prev_delay = delivery.metadata.get("_prev_retry_delay")
+
+                delay = retry_policy.delay_for_attempt(
+                    attempt.attempt_number - 1,
+                    prev_delay=prev_delay,
+                )
+                delivery.metadata["_prev_retry_delay"] = delay
                 from datetime import timedelta
                 next_retry_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
                 delivery.status = DeliveryStatus.RETRYING
@@ -361,6 +456,7 @@ class DeliveryEngine:
                     delivery.id,
                     status=DeliveryStatus.RETRYING,
                     next_retry_at=next_retry_dt,
+                    metadata=delivery.metadata,
                 )
                 self._record_metric("delivery_retried")
             else:
@@ -380,6 +476,7 @@ class DeliveryEngine:
         event_type: str | None = None,
         metadata: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
     ) -> WebhookDelivery:
         """Create and immediately process a webhook delivery."""
         delivery = WebhookDelivery(
@@ -388,6 +485,7 @@ class DeliveryEngine:
             event_type=event_type,
             metadata=metadata or {},
             payload_headers=headers or {},
+            idempotency_key=idempotency_key,
         )
         self._store.add_delivery(delivery)
         result = await self.process_delivery(delivery.id)

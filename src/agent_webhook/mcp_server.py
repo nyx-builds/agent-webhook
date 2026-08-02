@@ -88,6 +88,22 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                             },
                             "required": ["max_requests"],
                         },
+                        "jitter": {
+                            "type": "string",
+                            "enum": ["none", "full", "equal", "decorrelated"],
+                            "default": "full",
+                            "description": "Jitter strategy for retry backoff. full=random(0,delay), equal=half+random(0,half), decorrelated=uses prev delay",
+                        },
+                        "timestamped_signatures": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Include timestamp in HMAC signature for replay protection (t=<ts>,v1=<hmac> format)",
+                        },
+                        "idempotency_keys": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Auto-generate Idempotency-Key header (UUID) for each delivery",
+                        },
                     },
                     "required": ["name", "url"],
                 },
@@ -159,6 +175,7 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                         "event_type": {"type": "string", "description": "Event type tag"},
                         "headers": {"type": "object", "description": "Extra headers for this delivery"},
                         "metadata": {"type": "object", "description": "Extra metadata"},
+                        "idempotency_key": {"type": "string", "description": "Idempotency key for safe deduplication (sent as Idempotency-Key header)"},
                     },
                     "required": ["endpoint_id", "payload"],
                 },
@@ -894,6 +911,47 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     "required": ["name"],
                 },
             ),
+            Tool(
+                name="idempotency_key_generate",
+                description="Generate a UUID idempotency key for safe retry deduplication. "
+                "Pass this key when creating deliveries so receivers can deduplicate redeliveries.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="verify_timestamped_signature",
+                description="Verify a timestamped HMAC signature (t=<ts>,v1=<hmac> format). "
+                "Used to verify outbound webhook authenticity and prevent replay attacks. "
+                "Pass the shared secret, the original payload, and the signature header value.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "secret": {"type": "string", "description": "Shared HMAC secret"},
+                        "payload": {"type": "string", "description": "Raw payload string that was signed"},
+                        "signature": {"type": "string", "description": "Signature header value (t=<ts>,v1=<hmac>)"},
+                        "tolerance_seconds": {"type": "integer", "default": 300, "description": "Max age in seconds"},
+                    },
+                    "required": ["secret", "payload", "signature"],
+                },
+            ),
+            Tool(
+                name="backoff_curve_preview",
+                description="Preview the retry backoff curve for a given jitter strategy. "
+                "Returns the base delay and 10 jittered samples for each attempt, so you can "
+                "see the spread of retry delays before configuring an endpoint.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "initial_delay_seconds": {"type": "number", "default": 1.0},
+                        "max_delay_seconds": {"type": "number", "default": 300.0},
+                        "backoff_multiplier": {"type": "number", "default": 2.0},
+                        "max_retries": {"type": "integer", "default": 5},
+                        "jitter": {"type": "string", "enum": ["none", "full", "equal", "decorrelated"], "default": "full"},
+                    },
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -909,6 +967,7 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     "initial_delay_seconds": arguments.get("initial_delay_seconds", 1.0),
                     "max_delay_seconds": arguments.get("max_delay_seconds", 300.0),
                     "backoff_multiplier": arguments.get("backoff_multiplier", 2.0),
+                    "jitter": arguments.get("jitter", "full"),
                 }
                 if "retry_on_status_codes" in arguments:
                     retry_policy_kwargs["retry_on_status_codes"] = arguments["retry_on_status_codes"]
@@ -937,6 +996,8 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     retry_policy=retry_policy_kwargs,
                     transform_ids=arguments.get("transform_ids", []),
                     rate_limit=rate_limit_obj,
+                    timestamped_signatures=arguments.get("timestamped_signatures", False),
+                    idempotency_keys=arguments.get("idempotency_keys", False),
                 )
                 store.add_endpoint(endpoint_obj)
                 return [TextContent(type="text", text=json.dumps(endpoint_obj.model_dump(mode="json"), default=str, indent=2))]
@@ -987,6 +1048,7 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     event_type=arguments.get("event_type"),
                     metadata=arguments.get("metadata", {}),
                     headers=arguments.get("headers", {}),
+                    idempotency_key=arguments.get("idempotency_key"),
                 )
                 return [TextContent(type="text", text=json.dumps(result.model_dump(mode="json"), default=str, indent=2))]
 
@@ -1761,6 +1823,61 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     "note": "Store this key securely. It will not be shown again.",
                 }
                 return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
+
+            elif name == "idempotency_key_generate":
+                import uuid as _uuid
+                key = str(_uuid.uuid4())
+                return [TextContent(type="text", text=json.dumps({
+                    "idempotency_key": key,
+                    "usage": "Pass this as idempotency_key when creating deliveries. "
+                             "Receivers should store it to deduplicate redeliveries.",
+                }, indent=2))]
+
+            elif name == "verify_timestamped_signature":
+                valid = engine.verify_timestamped_signature(
+                    secret=arguments["secret"],
+                    payload=arguments["payload"],
+                    signature_header=arguments["signature"],
+                    tolerance_seconds=arguments.get("tolerance_seconds", 300),
+                )
+                result = {"valid": valid}
+                if not valid:
+                    result["error"] = "Signature verification failed (invalid HMAC or timestamp outside tolerance)"
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "backoff_curve_preview":
+                from .models import RetryPolicy, JitterType
+                policy = RetryPolicy(
+                    initial_delay_seconds=arguments.get("initial_delay_seconds", 1.0),
+                    max_delay_seconds=arguments.get("max_delay_seconds", 300.0),
+                    backoff_multiplier=arguments.get("backoff_multiplier", 2.0),
+                    jitter=arguments.get("jitter", "full"),
+                )
+                max_retries = arguments.get("max_retries", 5)
+                curve = []
+                prev_delay = None
+                for attempt in range(max_retries + 1):
+                    base = policy.base_delay_for_attempt(attempt)
+                    samples = []
+                    for _ in range(10):
+                        d = policy.delay_for_attempt(attempt, prev_delay=prev_delay)
+                        samples.append(round(d, 3))
+                    curve.append({
+                        "attempt": attempt,
+                        "base_delay_seconds": round(base, 3),
+                        "jittered_samples": sorted(samples),
+                        "min_sample": min(samples),
+                        "max_sample": max(samples),
+                    })
+                    # Use the last sample as prev_delay for decorrelated
+                    prev_delay = samples[-1]
+                return [TextContent(type="text", text=json.dumps({
+                    "jitter": policy.jitter.value,
+                    "initial_delay_seconds": policy.initial_delay_seconds,
+                    "max_delay_seconds": policy.max_delay_seconds,
+                    "backoff_multiplier": policy.backoff_multiplier,
+                    "curve": curve,
+                }, indent=2))]
 
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]
