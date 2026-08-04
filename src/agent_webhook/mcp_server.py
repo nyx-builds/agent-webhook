@@ -952,6 +952,129 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     },
                 },
             ),
+            Tool(
+                name="retry_after_parse",
+                description="Parse a Retry-After HTTP header value (RFC 7231). "
+                "Supports both integer seconds ('120') and HTTP-date format "
+                "('Fri, 31 Dec 2026 23:59:59 GMT'). Returns the delay in seconds.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "header_value": {"type": "string", "description": "The Retry-After header value to parse"},
+                    },
+                    "required": ["header_value"],
+                },
+            ),
+            Tool(
+                name="secret_rotation_initiate",
+                description="Begin rotating the signing secret for an endpoint (zero-downtime rotation). "
+                "The current primary secret becomes 'previous' (still usable for verification), "
+                "and the new secret becomes the primary in 'rotating' status. "
+                "Delivers are signed with the new secret immediately.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                        "new_secret": {"type": "string", "description": "The new HMAC secret to rotate to"},
+                    },
+                    "required": ["endpoint_id", "new_secret"],
+                },
+            ),
+            Tool(
+                name="secret_rotation_verify",
+                description="Confirm that the new signing secret is working correctly. "
+                "Transitions the new primary from 'rotating' to 'active' and "
+                "retires the old previous secret (still usable during grace period).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="secret_rotation_complete",
+                description="Complete rotation by cleaning up expired retired secrets after the grace period. "
+                "Returns the number of old secrets removed.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="secret_rotation_status",
+                description="Get the current secret rotation status for an endpoint. "
+                "Shows all active secrets, their roles (primary/previous), statuses, and versions.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="secret_rotation_cancel",
+                description="Cancel an in-progress rotation and revert to the previous primary secret.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="verify_endpoint_create",
+                description="Create an endpoint verification challenge. "
+                "Generates a random token that the endpoint must echo back in a response "
+                "header (X-Webhook-Verify-Challenge) or JSON body field to prove ownership. "
+                "Used before activating a new endpoint to prevent misconfigured or malicious URLs.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID to verify"},
+                        "method": {"type": "string", "enum": ["GET", "POST"], "default": "POST", "description": "HTTP method for verification request"},
+                        "location": {"type": "string", "enum": ["header", "body", "either"], "default": "either", "description": "Where endpoint must echo the token"},
+                        "header_name": {"type": "string", "default": "X-Webhook-Verify-Challenge", "description": "Response header to check"},
+                        "body_field": {"type": "string", "default": "challenge", "description": "JSON body field to check"},
+                        "ttl_seconds": {"type": "integer", "default": 600, "description": "Challenge validity period"},
+                        "max_attempts": {"type": "integer", "default": 3, "description": "Max verification attempts"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="verify_endpoint_validate",
+                description="Validate an endpoint's response to a verification challenge. "
+                "Checks the response header and/or body for the challenge token. "
+                "The token must be echoed correctly for verification to succeed.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID being verified"},
+                        "response_headers": {"type": "object", "description": "Headers from the endpoint's response"},
+                        "response_body": {"description": "Body from the endpoint's response (object or string)"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
+            Tool(
+                name="verify_endpoint_status",
+                description="Get the verification challenge status for an endpoint. "
+                "Returns pending/verified/failed/expired status and details.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "endpoint_id": {"type": "string", "description": "Endpoint ID"},
+                    },
+                    "required": ["endpoint_id"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -1878,6 +2001,126 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                     "backoff_multiplier": policy.backoff_multiplier,
                     "curve": curve,
                 }, indent=2))]
+
+            elif name == "retry_after_parse":
+                delay = engine.parse_retry_after(arguments["header_value"])
+                result: dict[str, Any] = {"input": arguments["header_value"]}
+                if delay is not None:
+                    result["delay_seconds"] = round(delay, 3)
+                    result["parsed"] = True
+                else:
+                    result["parsed"] = False
+                    result["error"] = "Could not parse Retry-After header value"
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+            elif name == "secret_rotation_initiate":
+                mgr = engine.secret_rotation
+                eid = arguments["endpoint_id"]
+                # Register initial secret if endpoint has one but rotation not yet initialized
+                if mgr.get_rotation_status(eid)["secrets"] == []:
+                    ep = store.get_endpoint(eid)
+                    if ep and ep.secret:
+                        mgr.register_secret(eid, ep.secret)
+                    else:
+                        return [TextContent(type="text", text=json.dumps(
+                            {"error": "Endpoint has no existing secret. Register a secret first."}
+                        ))]
+                new_rs = mgr.initiate_rotation(eid, arguments["new_secret"])
+                return [TextContent(type="text", text=json.dumps({
+                    "endpoint_id": eid,
+                    "message": "Rotation initiated. New primary is in 'rotating' status.",
+                    "new_secret_version": new_rs.version,
+                    "status": mgr.get_rotation_status(eid),
+                }, default=str, indent=2))]
+
+            elif name == "secret_rotation_verify":
+                mgr = engine.secret_rotation
+                eid = arguments["endpoint_id"]
+                verified = mgr.verify_rotation(eid)
+                return [TextContent(type="text", text=json.dumps({
+                    "endpoint_id": eid,
+                    "verified": verified,
+                    "status": mgr.get_rotation_status(eid),
+                }, default=str, indent=2))]
+
+            elif name == "secret_rotation_complete":
+                mgr = engine.secret_rotation
+                eid = arguments["endpoint_id"]
+                removed = mgr.complete_rotation(eid)
+                return [TextContent(type="text", text=json.dumps({
+                    "endpoint_id": eid,
+                    "secrets_removed": removed,
+                    "status": mgr.get_rotation_status(eid),
+                }, default=str, indent=2))]
+
+            elif name == "secret_rotation_status":
+                mgr = engine.secret_rotation
+                status = mgr.get_rotation_status(arguments["endpoint_id"])
+                return [TextContent(type="text", text=json.dumps(status, default=str, indent=2))]
+
+            elif name == "secret_rotation_cancel":
+                mgr = engine.secret_rotation
+                eid = arguments["endpoint_id"]
+                cancelled = mgr.cancel_rotation(eid)
+                return [TextContent(type="text", text=json.dumps({
+                    "endpoint_id": eid,
+                    "cancelled": cancelled,
+                    "status": mgr.get_rotation_status(eid),
+                }, default=str, indent=2))]
+
+            elif name == "verify_endpoint_create":
+                cm = engine.challenge_manager
+                from .verification import ChallengeLocation
+                eid = arguments["endpoint_id"]
+                location = ChallengeLocation(arguments.get("location", "either"))
+                challenge = cm.create_challenge(
+                    endpoint_id=eid,
+                    method=arguments.get("method", "POST"),
+                    location=location,
+                    header_name=arguments.get("header_name", "X-Webhook-Verify-Challenge"),
+                    body_field=arguments.get("body_field", "challenge"),
+                    ttl_override=arguments.get("ttl_seconds"),
+                    max_attempts=arguments.get("max_attempts", 3),
+                )
+                return [TextContent(type="text", text=json.dumps({
+                    "endpoint_id": eid,
+                    "token": challenge.token,
+                    "message": (
+                        f"Send a {challenge.method} request to the endpoint with this token. "
+                        f"The endpoint must echo it in header '{challenge.header_name}' "
+                        f"or body field '{challenge.body_field}'. "
+                        f"Use verify_endpoint_validate to check the response."
+                    ),
+                    "expires_at": challenge.expires_at.isoformat(),
+                    "max_attempts": challenge.max_attempts,
+                }, indent=2))]
+
+            elif name == "verify_endpoint_validate":
+                cm = engine.challenge_manager
+                eid = arguments["endpoint_id"]
+                valid = cm.validate_response(
+                    endpoint_id=eid,
+                    response_headers=arguments.get("response_headers"),
+                    response_body=arguments.get("response_body"),
+                )
+                ch = cm.get_challenge(eid)
+                return [TextContent(type="text", text=json.dumps({
+                    "endpoint_id": eid,
+                    "verified": valid,
+                    "status": ch.status.value if ch else "none",
+                    "detail": ch.response_detail if ch else "No challenge found",
+                    "attempts": ch.attempts if ch else 0,
+                }, indent=2))]
+
+            elif name == "verify_endpoint_status":
+                cm = engine.challenge_manager
+                eid = arguments["endpoint_id"]
+                ch = cm.get_challenge(eid)
+                if ch is None:
+                    return [TextContent(type="text", text=json.dumps(
+                        {"endpoint_id": eid, "status": "none", "message": "No verification challenge exists for this endpoint."}
+                    ))]
+                return [TextContent(type="text", text=json.dumps(ch.to_dict(), default=str, indent=2))]
 
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]

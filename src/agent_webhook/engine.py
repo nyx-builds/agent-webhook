@@ -26,6 +26,8 @@ from .rate_limiter import RateLimiter
 from .store import WebhookStore
 from .transforms import TransformEngine
 from .circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState
+from .secret_rotation import SecretRotationManager
+from .verification import ChallengeManager
 
 
 class DeliveryEngine:
@@ -38,6 +40,8 @@ class DeliveryEngine:
         self._rate_limiter = RateLimiter()
         self._transform_engine = TransformEngine()
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
+        self._secret_rotation = SecretRotationManager()
+        self._challenge_manager = ChallengeManager()
 
     def _record_metric(self, metric_type: str, **kwargs: Any) -> None:
         """Record a metric event. Non-blocking — ignores errors."""
@@ -86,6 +90,45 @@ class DeliveryEngine:
         else:
             raise ValueError(f"Unsupported algorithm: {algorithm}")
         return f"{algorithm}={digest.hexdigest()}"
+
+    @staticmethod
+    def parse_retry_after(header_value: str | None) -> float | None:
+        """Parse a ``Retry-After`` HTTP header value (RFC 7231 §7.1.3).
+
+        The header can be either:
+        - A non-negative integer (seconds to wait): ``Retry-After: 120``
+        - An HTTP-date (wait until that time): ``Retry-After: Fri, 31 Dec 2026 23:59:59 GMT``
+
+        Returns:
+            Delay in seconds (float), or None if the header is missing or unparseable.
+        """
+        if not header_value:
+            return None
+
+        value = header_value.strip()
+
+        # Try integer (seconds)
+        try:
+            seconds = int(value)
+            if seconds >= 0:
+                return float(seconds)
+        except ValueError:
+            pass
+
+        # Try HTTP-date
+        try:
+            from email.utils import parsedate_to_datetime
+            target = parsedate_to_datetime(value)
+            if target is not None:
+                now = datetime.now(timezone.utc)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=timezone.utc)
+                delay = (target - now).total_seconds()
+                return max(0.0, delay)
+        except (TypeError, ValueError):
+            pass
+
+        return None
 
     @staticmethod
     def generate_timestamped_signature(secret: str, payload: str, algorithm: str = "sha256") -> tuple[str, int]:
@@ -167,7 +210,7 @@ class DeliveryEngine:
         """Build headers for a webhook delivery."""
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "agent-webhook/0.8.0",
+            "User-Agent": "agent-webhook/0.9.0",
             "X-Webhook-ID": delivery.id,
             "X-Webhook-Event": delivery.event_type or "generic",
             "X-Webhook-Timestamp": datetime.now(timezone.utc).isoformat(),
@@ -242,6 +285,16 @@ class DeliveryEngine:
         if endpoint_id not in self._circuit_breakers:
             return None
         return self._circuit_breakers[endpoint_id].reset(endpoint_id)
+
+    @property
+    def secret_rotation(self) -> SecretRotationManager:
+        """Access the multi-secret rotation manager."""
+        return self._secret_rotation
+
+    @property
+    def challenge_manager(self) -> ChallengeManager:
+        """Access the endpoint verification challenge manager."""
+        return self._challenge_manager
 
     async def deliver(self, delivery: WebhookDelivery) -> DeliveryAttempt:
         """Execute a single delivery attempt."""
@@ -346,12 +399,25 @@ class DeliveryEngine:
             attempt.response_headers = dict(response.headers)
             attempt.completed_at = datetime.now(timezone.utc)
 
+            # Parse Retry-After header (RFC 7231) for retryable responses
+            retry_after_delay: float | None = None
+            if response.status_code in endpoint.retry_policy.retry_on_status_codes:
+                raw_ra = response.headers.get("retry-after") or response.headers.get("Retry-After")
+                retry_after_delay = self.parse_retry_after(raw_ra)
+                if retry_after_delay is not None:
+                    # Store for use by process_delivery when scheduling retry
+                    attempt.metadata = attempt.metadata or {}
+                    attempt.metadata["retry_after_seconds"] = retry_after_delay
+                    if raw_ra:
+                        attempt.metadata["retry_after_raw"] = raw_ra
+
             # Determine if successful
             if 200 <= response.status_code < 300:
                 attempt.status = DeliveryStatus.SUCCESS
             elif response.status_code in endpoint.retry_policy.retry_on_status_codes:
                 attempt.status = DeliveryStatus.FAILED
-                attempt.error_message = f"Retryable status code: {response.status_code}"
+                ra_note = f" (server Retry-After: {retry_after_delay}s)" if retry_after_delay is not None else ""
+                attempt.error_message = f"Retryable status code: {response.status_code}{ra_note}"
             else:
                 attempt.status = DeliveryStatus.FAILED
                 attempt.error_message = f"Non-retryable status code: {response.status_code}"
@@ -443,10 +509,21 @@ class DeliveryEngine:
                 # We store it in the delivery metadata so it persists between attempts.
                 prev_delay = delivery.metadata.get("_prev_retry_delay")
 
-                delay = retry_policy.delay_for_attempt(
-                    attempt.attempt_number - 1,
-                    prev_delay=prev_delay,
-                )
+                # Check if the server sent a Retry-After header (RFC 7231).
+                # If present, it takes precedence over the computed backoff delay
+                # — the server knows how long it needs to recover.
+                server_retry_after = None
+                if attempt.metadata:
+                    server_retry_after = attempt.metadata.get("retry_after_seconds")
+
+                if server_retry_after is not None:
+                    # Respect server-requested delay, clamped to max_delay
+                    delay = min(server_retry_after, retry_policy.max_delay_seconds)
+                else:
+                    delay = retry_policy.delay_for_attempt(
+                        attempt.attempt_number - 1,
+                        prev_delay=prev_delay,
+                    )
                 delivery.metadata["_prev_retry_delay"] = delay
                 from datetime import timedelta
                 next_retry_dt = datetime.now(timezone.utc) + timedelta(seconds=delay)

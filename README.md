@@ -7,9 +7,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/nyx-builds/agent-webhook/actions/workflows/ci.yml/badge.svg)](https://github.com/nyx-builds/agent-webhook/actions/workflows/ci.yml)
-[![Tests: 612](https://img.shields.io/badge/tests-612%20passing-brightgreen.svg)](#testing)
+[![Tests: 743](https://img.shields.io/badge/tests-743%20passing-brightgreen.svg)](#testing)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed)](https://modelcontextprotocol.io)
-[![Version: 0.7.0](https://img.shields.io/badge/version-0.7.0-blue.svg)](#changelog)
+[![Version: 0.9.0](https://img.shields.io/badge/version-0.9.0-blue.svg)](#changelog)
 
 </div>
 
@@ -39,6 +39,9 @@ Built for the agentic economy — by [Nyx Builds](https://github.com/nyx-builds)
 - **API Key Authentication** — SHA-256 hashed API keys with scopes, expiration, and revocation for securing the REST API
 - **Rate Limiting** — Per-endpoint rate limits with burst capacity
 - **Prometheus Metrics** — Delivery counts, durations, rate-limit and dead-letter counters exposed via `/metrics`
+- **Retry-After Header Support** — Automatically respects server-requested retry delays via RFC 7231 `Retry-After` header on 429/503 responses — overrides backoff when the server signals how long to wait
+- **Multi-Secret Rotation** — Zero-downtime HMAC signing key rotation with grace-period overlap: initiate → verify → complete lifecycle, old secrets remain valid for verification during transition
+- **Endpoint Verification Challenge** — Prove endpoint ownership before activation via challenge-response flow: endpoint must echo a random token in a header or JSON body field, with configurable TTL, location, and max attempts
 - **Import / Export** — Portable config export (secrets excluded by default) with skip/overwrite/rename conflict resolution
 - **Health Checks** — Test endpoint connectivity with ping payloads
 - **Event Audit Log** — Timestamped log of all webhook events for audit trails
@@ -49,7 +52,7 @@ Built for the agentic economy — by [Nyx Builds](https://github.com/nyx-builds)
 - **Background Worker Pool** — Async worker pool for processing deliveries, schedules, and retries in the background
 - **REST API** — Optional FastAPI server for HTTP access to all operations
 - **Service Layer** — Clean business logic API on top of store and engine
-- **MCP Server** — 70 tools for full webhook management from any MCP-compatible agent
+- **MCP Server** — 82 tools for full webhook management from any MCP-compatible agent
 - **Rich CLI** — Beautiful terminal interface with tables, colors, and filtering
 - **SQLite Backend** — Default persistent storage with JSON-to-SQLite migration; JSON file backend also supported
 
@@ -536,6 +539,19 @@ pytest tests/test_service.py -v
 ```
 
 ## Changelog
+
+### v0.9.0
+- **Retry-After Header Support (RFC 7231)** — When a downstream server returns a 429, 503, or other retryable status with a `Retry-After` header, the engine now parses both integer-seconds (`Retry-After: 120`) and HTTP-date (`Retry-After: Fri, 31 Dec 2026 23:59:59 GMT`) formats and uses the server-requested delay instead of the computed backoff. The delay is clamped to `max_delay_seconds` for safety. MCP tool: `retry_after_parse`.
+- **Multi-Secret Rotation** — Zero-downtime HMAC signing key rotation via `SecretRotationManager`. Full lifecycle: `initiate_rotation` (demotes current primary to "previous", promotes new secret to "rotating") → `verify_rotation` (confirms new secret working, retires old with grace period) → `complete_rotation` (cleans up expired secrets). Old secrets remain valid for incoming verification during the grace period (default 24h). Cancel mid-rotation with `cancel_rotation`. MCP tools: `secret_rotation_initiate`, `secret_rotation_verify`, `secret_rotation_complete`, `secret_rotation_status`, `secret_rotation_cancel`.
+- **Endpoint Verification Challenge** — Prove endpoint ownership before activation via `ChallengeManager`. Generates a cryptographically secure random token (256-bit) that the endpoint must echo back in a response header (`X-Webhook-Verify-Challenge`) or JSON body field (`{"challenge": "<token>"}`). Configurable verification location (header/body/either), TTL (default 10min), and max attempts (default 3). Constant-time token comparison prevents timing attacks. MCP tools: `verify_endpoint_create`, `verify_endpoint_validate`, `verify_endpoint_status`.
+- **DeliveryAttempt Metadata** — Added `metadata` field to `DeliveryAttempt` model for storing per-attempt data (e.g. `retry_after_seconds` from server responses).
+- **MCP Server** — Expanded from 73 to 82 tools (+9 new).
+- **Tests** — Expanded from 661 to 743 tests (+82 new in `test_v090_features.py`).
+
+### v0.8.0
+- **Jitter Strategies** — Four retry backoff jitter strategies to prevent thundering-herd retries: `none` (pure exponential), `full` (AWS-recommended uniform random), `equal` (half-base + random), `decorrelated` (previous-delay-based). MCP tool: `backoff_curve_preview`.
+- **Timestamped Signatures** — Outbound HMAC signatures include timestamp + nonce for replay protection (`t=<unix_ts>,v1=<hmac>` format). MCP tool: `verify_timestamped_signature`.
+- **Idempotency Keys** — Auto-generate `Idempotency-Key` header (UUID) for each delivery so receivers can safely deduplicate redeliveries. MCP tool: `idempotency_key_generate`.
 
 ### v0.7.0
 - **Alert Rules** — Proactive alerting system with 5 condition types (circuit_open, dlq_threshold, endpoint_failure_rate, endpoint_down, delivery_stalled), cooldown periods to prevent alert fatigue, and 3 notification channels (LogChannel for audit log, WebhookChannel for forwarding, CallbackChannel for custom handlers). Preset default rules and custom rule creation. REST API: `/alerts/summary`, `/alerts/evaluate`. CLI: `alert list-presets`, `alert summary`, `alert evaluate`. MCP tools: `alert_summary`, `alert_evaluate`.

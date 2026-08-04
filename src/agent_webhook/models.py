@@ -255,6 +255,7 @@ class DeliveryAttempt(BaseModel):
     response_headers: dict[str, str] | None = None
     error_message: str | None = None
     duration_ms: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Extra metadata (e.g. retry_after_seconds from server)")
 
 
 class WebhookDelivery(BaseModel):
