@@ -7,9 +7,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/nyx-builds/agent-webhook/actions/workflows/ci.yml/badge.svg)](https://github.com/nyx-builds/agent-webhook/actions/workflows/ci.yml)
-[![Tests: 743](https://img.shields.io/badge/tests-743%20passing-brightgreen.svg)](#testing)
+[![Tests: 924](https://img.shields.io/badge/tests-924%20passing-brightgreen.svg)](#testing)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed)](https://modelcontextprotocol.io)
-[![Version: 0.9.0](https://img.shields.io/badge/version-0.9.0-blue.svg)](#changelog)
+[![Version: 1.0.0](https://img.shields.io/badge/version-1.0.0-blue.svg)](#changelog)
 
 </div>
 
@@ -42,6 +42,10 @@ Built for the agentic economy — by [Nyx Builds](https://github.com/nyx-builds)
 - **Retry-After Header Support** — Automatically respects server-requested retry delays via RFC 7231 `Retry-After` header on 429/503 responses — overrides backoff when the server signals how long to wait
 - **Multi-Secret Rotation** — Zero-downtime HMAC signing key rotation with grace-period overlap: initiate → verify → complete lifecycle, old secrets remain valid for verification during transition
 - **Endpoint Verification Challenge** — Prove endpoint ownership before activation via challenge-response flow: endpoint must echo a random token in a header or JSON body field, with configurable TTL, location, and max attempts
+- **Transaction Outbox Pattern** — Every outbound webhook event is durably recorded BEFORE delivery, guaranteeing at-least-once delivery semantics. Survives process crashes and enables event recovery
+- **Event Replay** — Re-deliver events from any time range with filter criteria (event type, endpoint, source). Batched execution with progress tracking, cancellation, and override-target support for endpoint migration
+- **Schema Registry & Validation** — Register versioned JSON Schemas per event type. Validate payloads before delivery (strict mode blocks, non-strict warns). Supports schema evolution with multiple active versions
+- **Fan-Out Delivery Groups** — Deliver to named endpoint groups with strategies: parallel (concurrent, bounded by max_concurrent), sequential (one at a time, early-stop on failure-strategy satisfaction), and weighted (canary/blue-green rollouts by member weight). Failure strategies: all_must_succeed, any_success, majority_success, ignore
 - **Import / Export** — Portable config export (secrets excluded by default) with skip/overwrite/rename conflict resolution
 - **Health Checks** — Test endpoint connectivity with ping payloads
 - **Event Audit Log** — Timestamped log of all webhook events for audit trails
@@ -52,7 +56,7 @@ Built for the agentic economy — by [Nyx Builds](https://github.com/nyx-builds)
 - **Background Worker Pool** — Async worker pool for processing deliveries, schedules, and retries in the background
 - **REST API** — Optional FastAPI server for HTTP access to all operations
 - **Service Layer** — Clean business logic API on top of store and engine
-- **MCP Server** — 82 tools for full webhook management from any MCP-compatible agent
+- **MCP Server** — 105 tools for full webhook management from any MCP-compatible agent
 - **Rich CLI** — Beautiful terminal interface with tables, colors, and filtering
 - **SQLite Backend** — Default persistent storage with JSON-to-SQLite migration; JSON file backend also supported
 
@@ -218,7 +222,7 @@ Or configure in your MCP client:
 }
 ```
 
-### MCP Tools (70)
+### MCP Tools (105)
 
 | Tool | Description |
 |------|-------------|
@@ -292,6 +296,41 @@ Or configure in your MCP client:
 | `retention_estimate` | Preview retention cleanup impact (dry run) |
 | `retention_cleanup` | Run data retention cleanup |
 | `apikey_generate` | Generate a new API key with optional scopes/expiry |
+| `backoff_curve_preview` | Preview retry backoff timing with jitter strategies |
+| `verify_timestamped_signature` | Verify timestamped HMAC signature (replay protection) |
+| `idempotency_key_generate` | Generate an idempotency key for deduplication |
+| `retry_after_parse` | Parse RFC 7231 Retry-After header value |
+| `secret_rotation_initiate` | Begin HMAC key rotation (new secret becomes primary) |
+| `secret_rotation_verify` | Verify new secret is working during rotation |
+| `secret_rotation_complete` | Complete rotation, retire old secrets |
+| `secret_rotation_status` | Check current rotation state |
+| `secret_rotation_cancel` | Cancel in-progress key rotation |
+| `verify_endpoint_create` | Create endpoint verification challenge |
+| `verify_endpoint_validate` | Validate endpoint challenge response |
+| `verify_endpoint_status` | Check verification challenge status |
+| `outbox_list` | List outbox entries with filters (event_type, source, status) |
+| `outbox_get` | Get a single outbox entry by ID |
+| `outbox_stats` | Aggregate outbox statistics (delivery rate, counts) |
+| `replay_create` | Create a replay batch (preview, no delivery) |
+| `replay_execute` | Execute a replay batch — re-deliver selected events |
+| `replay_status` | Get replay batch progress (processed, succeeded, failed) |
+| `replay_list` | List replay batches, optionally filtered by status |
+| `replay_cancel` | Cancel a pending or in-progress replay batch |
+| `schema_create` | Register a versioned JSON Schema for an event type |
+| `schema_get` | Get a schema by event type and version |
+| `schema_list` | List registered schema versions |
+| `schema_validate` | Validate a payload against a registered schema |
+| `schema_delete` | Delete a schema version |
+| `group_create` | Create a delivery group (fan-out to multiple endpoints) |
+| `group_get` | Get delivery group details |
+| `group_list` | List delivery groups |
+| `group_update` | Update group strategy, failure strategy, or settings |
+| `group_delete` | Delete a delivery group |
+| `group_add_member` | Add an endpoint to a delivery group |
+| `group_remove_member` | Remove an endpoint from a delivery group |
+| `group_deliver` | Deliver a payload to all group members |
+| `group_deliveries_list` | List delivery results for a group |
+| `group_stats` | Per-group delivery statistics |
 
 ## Python API
 
@@ -539,6 +578,27 @@ pytest tests/test_service.py -v
 ```
 
 ## Changelog
+
+### v1.0.0 — Transaction Outbox, Event Replay, Schema Registry, Fan-Out Delivery Groups
+
+**The v1.0.0 milestone** — enterprise-grade reliability patterns for mission-critical webhook delivery.
+
+- **Transaction Outbox Pattern** — Every outbound webhook event is now durably recorded in an append-only outbox BEFORE delivery is attempted. This guarantees at-least-once delivery semantics: if the process crashes after recording but before delivery, the event survives and can be recovered. Engine: `OutboxEngine` with `record_event()`, `finalize_entry()`, `list_entries()`, `outbox_stats()`. MCP tools: `outbox_list`, `outbox_get`, `outbox_stats`. REST: `GET /outbox`, `GET /outbox/{id}`, `GET /outbox/stats`. CLI: `outbox list`, `outbox show`, `outbox stats`.
+
+- **Event Replay Engine** — Re-deliver outbox events from any time range with powerful filtering (event type, endpoint, source, time window). Batches are created first (preview mode, no delivery), then explicitly executed. Supports override-target mode for delivering to different endpoints than the originals — critical for endpoint migration and disaster recovery. Batch lifecycle: created → running → completed/cancelled. MCP tools: `replay_create`, `replay_execute`, `replay_status`, `replay_list`, `replay_cancel`. REST: `POST /replay/create`, `POST /replay/{id}/execute`, `GET /replay/{id}`, `GET /replay`, `POST /replay/{id}/cancel`. CLI: `replay create`, `replay execute`, `replay status`, `replay list`, `replay cancel`.
+
+- **Schema Registry & Payload Validation** — Register versioned JSON Schemas per event type. Validate payloads against schemas before delivery: strict mode blocks invalid payloads from being sent, non-strict mode delivers with a warning. Multiple schema versions can coexist for smooth schema evolution. MCP tools: `schema_create`, `schema_get`, `schema_list`, `schema_validate`, `schema_delete`. REST: `POST /schemas`, `GET /schemas`, `GET /schemas/{type}`, `POST /schemas/validate`, `DELETE /schemas/{id}`. CLI: `schema create`, `schema list`, `schema validate`.
+
+- **Fan-Out Delivery Groups** — Named groups of endpoints that receive deliveries together via configurable strategies:
+  - **Parallel**: All members receive concurrently (bounded by `max_concurrent`)
+  - **Sequential**: Members are called one at a time; stops early if the failure strategy is already satisfied (e.g. `any_success` after the first hit)
+  - **Weighted**: Members selected by weight — only a fraction receives the event. Ideal for canary deployments and blue-green rollouts
+  
+  Failure strategies: `all_must_succeed` (every member must succeed), `any_success` (at least one), `majority_success` (>50%), `ignore` (always succeed regardless). Engine: `FanoutEngine` with group CRUD, member management, `deliver()`, dry-run mode, delivery history, and per-group stats. MCP tools: `group_create`, `group_get`, `group_list`, `group_update`, `group_delete`, `group_add_member`, `group_remove_member`, `group_deliver`, `group_deliveries_list`, `group_stats`. REST: full CRUD under `/groups`. CLI: `group create`, `group list`, `group show`, `group add-member`, `group remove-member`, `group deliver [--dry-run]`, `group deliveries`, `group stats`, `group delete`.
+
+- **MCP Server** — Expanded from 82 to 105 tools (+23 new).
+- **Tests** — Expanded from 743 to 924 tests (+181 new across `test_v100_features.py` and `test_v100_fanout.py`).
+- **CLI** — 25 new commands across 4 groups: `outbox`, `replay`, `schema`, `group`.
 
 ### v0.9.0
 - **Retry-After Header Support (RFC 7231)** — When a downstream server returns a 429, 503, or other retryable status with a `Retry-After` header, the engine now parses both integer-seconds (`Retry-After: 120`) and HTTP-date (`Retry-After: Fri, 31 Dec 2026 23:59:59 GMT`) formats and uses the server-requested delay instead of the computed backoff. The delay is clamped to `max_delay_seconds` for safety. MCP tool: `retry_after_parse`.

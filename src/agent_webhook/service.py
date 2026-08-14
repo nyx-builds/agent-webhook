@@ -7,18 +7,31 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .engine import DeliveryEngine
+from .fanout import FanoutEngine
 from .models import (
     DeadLetterEntry,
     DeliveryAttempt,
+    DeliveryGroup,
+    DeliveryGroupMember,
     DeliveryStatus,
     EventLogEntry,
     EventSubscription,
+    FanoutStrategy,
+    GroupDeliveryResult,
+    GroupDeliveryStatus,
+    GroupFailureStrategy,
+    GroupMemberResult,
+    GroupMemberStatus,
+    GroupStatus,
     Header,
     IncomingWebhook,
+    OutboxEntry,
+    OutboxStatus,
     PayloadTransform,
     RateLimit,
     RateLimitPeriod,
     RelayRule,
+    ReplayBatch,
     RetryPolicy,
     ScheduleInterval,
     TransformType,
@@ -28,6 +41,7 @@ from .models import (
     WebhookSchedule,
     WebhookStatus,
 )
+from .outbox import OutboxEngine
 from .store import WebhookStore
 
 
@@ -43,6 +57,8 @@ class WebhookService:
         else:
             self._store = WebhookStore(store_path)
         self._engine = DeliveryEngine(self._store)
+        self._outbox = OutboxEngine(self._store)
+        self._fanout = FanoutEngine(self._store)
 
     @property
     def store(self) -> WebhookStore:
@@ -51,6 +67,14 @@ class WebhookService:
     @property
     def engine(self) -> DeliveryEngine:
         return self._engine
+
+    @property
+    def outbox(self) -> OutboxEngine:
+        return self._outbox
+
+    @property
+    def fanout(self) -> FanoutEngine:
+        return self._fanout
 
     # ── Endpoint Management ──────────────────────────────────────────
 
@@ -1036,5 +1060,325 @@ class WebhookService:
             "estimated_delivery": "No HTTP request made (dry run)",
         }
 
+    # ── Outbox & Replay ──────────────────────────────────────────────
+
+    def record_outbox_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        endpoint_ids: list[str],
+        source: str = "delivery",
+        headers: dict[str, str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> OutboxEntry | None:
+        """Record an event in the outbox before delivery."""
+        return self._outbox.record_event(
+            event_type=event_type,
+            payload=payload,
+            endpoint_ids=endpoint_ids,
+            source=source,
+            headers=headers,
+            metadata=metadata,
+        )
+
+    def finalize_outbox_entry(
+        self,
+        entry_id: str,
+        delivery_ids: list[str],
+        success_count: int,
+        failure_count: int,
+    ) -> OutboxEntry | None:
+        """Update an outbox entry after delivery completes."""
+        return self._outbox.finalize_entry(
+            entry_id=entry_id,
+            delivery_ids=delivery_ids,
+            success_count=success_count,
+            failure_count=failure_count,
+        )
+
+    def get_outbox_entry(self, entry_id: str) -> OutboxEntry | None:
+        return self._outbox.get_entry(entry_id)
+
+    def list_outbox(
+        self,
+        event_type: str | None = None,
+        source: str | None = None,
+        status: OutboxStatus | None = None,
+        endpoint_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 100,
+    ) -> list[OutboxEntry]:
+        return self._outbox.list_entries(
+            event_type=event_type,
+            source=source,
+            status=status,
+            endpoint_id=endpoint_id,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+
+    def outbox_stats(self) -> dict[str, Any]:
+        return self._outbox.outbox_stats()
+
+    def create_replay_batch(
+        self,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        event_type: str | None = None,
+        endpoint_id: str | None = None,
+        source: str | None = None,
+        target_endpoint_ids: list[str] | None = None,
+    ) -> ReplayBatch | None:
+        """Create a replay batch for re-delivering outbox events."""
+        return self._outbox.create_replay_batch(
+            start_time=start_time,
+            end_time=end_time,
+            event_type=event_type,
+            endpoint_id=endpoint_id,
+            source=source,
+            target_endpoint_ids=target_endpoint_ids,
+        )
+
+    async def execute_replay_batch(
+        self,
+        batch_id: str,
+    ) -> ReplayBatch | None:
+        """Execute a replay batch — re-delivers all selected outbox entries."""
+
+        async def _deliver_entry(entry: OutboxEntry) -> list[WebhookDelivery]:
+            # Determine target endpoints
+            if self._outbox is not None:
+                batch = self._outbox.get_replay_batch(batch_id)
+                if batch and batch.target_endpoint_ids:
+                    target_ids = batch.target_endpoint_ids
+                else:
+                    target_ids = entry.endpoint_ids
+            else:
+                target_ids = entry.endpoint_ids
+
+            results: list[WebhookDelivery] = []
+            for eid in target_ids:
+                try:
+                    d = await self._engine.send(
+                        endpoint_id=eid,
+                        payload=entry.payload,
+                        event_type=entry.event_type,
+                        metadata={
+                            **entry.metadata,
+                            "replayed_from_outbox": entry.id,
+                        },
+                        headers=entry.headers,
+                    )
+                    results.append(d)
+                except Exception:
+                    pass
+            return results
+
+        return await self._outbox.execute_replay_batch(
+            batch_id, delivery_callback=_deliver_entry
+        )
+
+    def cancel_replay_batch(self, batch_id: str) -> ReplayBatch | None:
+        return self._outbox.cancel_replay_batch(batch_id)
+
+    def get_replay_batch(self, batch_id: str) -> ReplayBatch | None:
+        return self._outbox.get_replay_batch(batch_id)
+
+    def list_replay_batches(self, status: str | None = None) -> list[ReplayBatch]:
+        return self._outbox.list_replay_batches(status=status)
+
+    # ── Schema Validation ───────────────────────────────────────────
+
+    def create_schema(
+        self,
+        event_type: str,
+        version: str,
+        schema: dict[str, Any],
+        strict: bool = False,
+        description: str | None = None,
+    ):
+        """Register a JSON Schema for validating event payloads."""
+        return self._outbox.create_schema(
+            event_type=event_type,
+            version=version,
+            schema=schema,
+            strict=strict,
+            description=description,
+        )
+
+    def get_schema(self, event_type: str, version: str | None = None):
+        """Get the active schema for an event type."""
+        return self._outbox.get_schema(event_type, version)
+
+    def list_schemas(self, event_type: str | None = None, active_only: bool = False):
+        """List registered schemas."""
+        return self._outbox.list_schemas(event_type, active_only)
+
+    def update_schema(self, sv_id: str, **updates: Any):
+        return self._outbox.update_schema(sv_id, **updates)
+
+    def delete_schema(self, sv_id: str) -> bool:
+        return self._outbox.delete_schema(sv_id)
+
+    def validate_payload(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate a payload against the active schema for an event type.
+
+        Returns dict with 'valid', 'errors', and 'schema_version'.
+        """
+        valid, errors, version = self._outbox.validate_payload(event_type, payload)
+        return {
+            "valid": valid,
+            "errors": errors,
+            "schema_version": version,
+        }
+
     async def close(self) -> None:
         await self._engine.close()
+
+    # ── Fan-Out Delivery Groups ─────────────────────────────────────
+
+    def create_delivery_group(
+        self,
+        name: str,
+        members: list[dict[str, Any]] | list[str],
+        strategy: str = "parallel",
+        failure_strategy: str = "all_must_succeed",
+        success_threshold: float = 1.0,
+        description: str | None = None,
+        max_concurrent: int = 0,
+        tags: list[str] | None = None,
+    ) -> DeliveryGroup:
+        """Create a named delivery group.
+
+        ``members`` can be a list of endpoint IDs (strings) or a list of
+        dicts with ``endpoint_id``, ``weight``, ``headers``, ``enabled``.
+        """
+        normalized_members = []
+        for m in members:
+            if isinstance(m, str):
+                normalized_members.append({"endpoint_id": m, "weight": 1})
+            else:
+                normalized_members.append(m)
+        return self._fanout.create_group(
+            name=name,
+            members=normalized_members,
+            strategy=strategy,
+            failure_strategy=failure_strategy,
+            success_threshold=success_threshold,
+            description=description,
+            max_concurrent=max_concurrent,
+            tags=tags,
+        )
+
+    def get_delivery_group(self, group_id: str) -> DeliveryGroup | None:
+        return self._fanout.get_group(group_id)
+
+    def list_delivery_groups(
+        self,
+        status: str | None = None,
+        tag: str | None = None,
+    ) -> list[DeliveryGroup]:
+        return self._fanout.list_groups(status=status, tag=tag)
+
+    def update_delivery_group(self, group_id: str, **updates: Any) -> DeliveryGroup | None:
+        return self._fanout.update_group(group_id, **updates)
+
+    def delete_delivery_group(self, group_id: str) -> bool:
+        return self._fanout.delete_group(group_id)
+
+    def add_group_member(
+        self,
+        group_id: str,
+        endpoint_id: str,
+        weight: int = 1,
+        headers: dict[str, str] | None = None,
+    ) -> DeliveryGroup | None:
+        return self._fanout.add_member(group_id, endpoint_id, weight=weight, headers=headers)
+
+    def remove_group_member(self, group_id: str, endpoint_id: str) -> bool:
+        return self._fanout.remove_member(group_id, endpoint_id)
+
+    async def fanout_deliver(
+        self,
+        group_id: str,
+        payload: dict[str, Any],
+        event_type: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> GroupDeliveryResult:
+        """Deliver a payload to all active members of a delivery group.
+
+        Uses the group's configured strategy (parallel, sequential, weighted)
+        and failure strategy to determine the aggregate outcome.
+        """
+        async def _deliver_callback(
+            endpoint_id: str,
+            payload: dict[str, Any],
+            headers: dict[str, str] | None = None,
+        ) -> dict[str, Any]:
+            """Delivery callback using the service's engine."""
+            try:
+                delivery = await self._engine.send(
+                    endpoint_id=endpoint_id,
+                    payload=payload,
+                    event_type=event_type,
+                    headers=headers or {},
+                )
+                last_attempt = delivery.last_attempt()
+                success = delivery.status == DeliveryStatus.SUCCESS
+                return {
+                    "delivery_id": delivery.id,
+                    "success": success,
+                    "status_code": last_attempt.response_status_code if last_attempt else None,
+                    "error": last_attempt.error_message if last_attempt and not success else None,
+                    "duration_ms": last_attempt.duration_ms if last_attempt else None,
+                }
+            except Exception as exc:
+                return {
+                    "delivery_id": None,
+                    "success": False,
+                    "status_code": None,
+                    "error": str(exc),
+                    "duration_ms": None,
+                }
+
+        return await self._fanout.deliver(
+            group_id=group_id,
+            payload=payload,
+            event_type=event_type,
+            headers=headers,
+            delivery_callback=_deliver_callback,
+        )
+
+    async def fanout_deliver_dry_run(
+        self,
+        group_id: str,
+        payload: dict[str, Any] | None = None,
+        event_type: str | None = None,
+    ) -> GroupDeliveryResult:
+        """Dry-run a fan-out delivery — simulates success without sending."""
+        return await self._fanout.deliver(
+            group_id=group_id,
+            payload=payload or {},
+            event_type=event_type,
+            delivery_callback=None,
+        )
+
+    def get_group_delivery(self, delivery_id: str) -> GroupDeliveryResult | None:
+        return self._fanout.get_delivery(delivery_id)
+
+    def list_group_deliveries(
+        self,
+        group_id: str | None = None,
+        status: str | None = None,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> list[GroupDeliveryResult]:
+        return self._fanout.list_deliveries(
+            group_id=group_id, status=status, event_type=event_type, limit=limit,
+        )
+
+    def group_delivery_stats(self, group_id: str) -> dict[str, Any]:
+        """Get aggregate delivery stats for a group."""
+        return self._fanout.group_stats(group_id)

@@ -31,6 +31,19 @@ from .models import (
 from .store import WebhookStore
 
 
+def _parse_dt(val: str | None) -> datetime | None:
+    """Parse an ISO 8601 datetime string to a timezone-aware datetime."""
+    if val is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(val)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
 def _get_sqlite_store(store_path: str):
     """Try to use SQLite store, fall back to JSON store."""
     if store_path.endswith(".json"):
@@ -1073,6 +1086,313 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                         "endpoint_id": {"type": "string", "description": "Endpoint ID"},
                     },
                     "required": ["endpoint_id"],
+                },
+            ),
+            # ── Outbox & Event Replay ────────────────────────────────────
+            Tool(
+                name="outbox_list",
+                description="List outbox entries with optional filters (event_type, source, status, endpoint_id, time range). "
+                "The outbox durably records every outbound webhook event before delivery for at-least-once semantics and replay.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "event_type": {"type": "string", "description": "Filter by event type"},
+                        "source": {"type": "string", "description": "Filter by source (delivery, schedule, broadcast, subscription, manual)"},
+                        "status": {"type": "string", "enum": ["pending", "delivered", "failed", "partial", "skipped"]},
+                        "endpoint_id": {"type": "string", "description": "Filter by target endpoint ID"},
+                        "start_time": {"type": "string", "description": "ISO 8601 start datetime"},
+                        "end_time": {"type": "string", "description": "ISO 8601 end datetime"},
+                        "limit": {"type": "integer", "default": 100},
+                    },
+                },
+            ),
+            Tool(
+                name="outbox_get",
+                description="Get a single outbox entry by ID, including payload, delivery results, and validation status.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"entry_id": {"type": "string"}},
+                    "required": ["entry_id"],
+                },
+            ),
+            Tool(
+                name="outbox_stats",
+                description="Get aggregate outbox statistics: total entries, delivery rate, breakdown by status.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="replay_create",
+                description="Create a replay batch to re-deliver outbox events. Filters by time range, event type, endpoint, or source. "
+                "Optionally override target endpoints to redirect events to new endpoints (e.g., during migration). "
+                "Returns a batch with preview of matched entries. Use replay_execute to actually deliver.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "start_time": {"type": "string", "description": "ISO 8601 — replay events from this time"},
+                        "end_time": {"type": "string", "description": "ISO 8601 — replay events until this time"},
+                        "event_type": {"type": "string", "description": "Only replay this event type"},
+                        "endpoint_id": {"type": "string", "description": "Only replay events for this endpoint"},
+                        "source": {"type": "string", "description": "Filter by source"},
+                        "target_endpoint_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Override target endpoints (omit to replay to original endpoints)",
+                        },
+                    },
+                },
+            ),
+            Tool(
+                name="replay_execute",
+                description="Execute a replay batch — actually re-deliver all selected outbox events. "
+                "This creates new deliveries for each outbox entry. The batch tracks progress and results.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"batch_id": {"type": "string"}},
+                    "required": ["batch_id"],
+                },
+            ),
+            Tool(
+                name="replay_status",
+                description="Get the status and progress of a replay batch — total entries, processed, succeeded, failed.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"batch_id": {"type": "string"}},
+                    "required": ["batch_id"],
+                },
+            ),
+            Tool(
+                name="replay_list",
+                description="List replay batches, optionally filtered by status.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "failed", "cancelled"]},
+                        "limit": {"type": "integer", "default": 50},
+                    },
+                },
+            ),
+            Tool(
+                name="replay_cancel",
+                description="Cancel a pending or in-progress replay batch.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"batch_id": {"type": "string"}},
+                    "required": ["batch_id"],
+                },
+            ),
+            # ── Schema Validation ───────────────────────────────────────
+            Tool(
+                name="schema_create",
+                description="Register a JSON Schema for validating event payloads before delivery. "
+                "Supports versioning — multiple versions can coexist for schema evolution.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "event_type": {"type": "string", "description": "Event type to validate (e.g. order.created)"},
+                        "version": {"type": "string", "description": "Schema version (e.g. '1.0')"},
+                        "schema": {"type": "object", "description": "JSON Schema definition"},
+                        "strict": {"type": "boolean", "default": False, "description": "Strict mode blocks delivery on validation failure"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["event_type", "version", "schema"],
+                },
+            ),
+            Tool(
+                name="schema_get",
+                description="Get the active JSON Schema for an event type, optionally for a specific version.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "event_type": {"type": "string"},
+                        "version": {"type": "string", "description": "Specific version (omit for latest active)"},
+                    },
+                    "required": ["event_type"],
+                },
+            ),
+            Tool(
+                name="schema_list",
+                description="List registered schema versions, optionally filtered by event type.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "event_type": {"type": "string"},
+                        "active_only": {"type": "boolean", "default": False},
+                    },
+                },
+            ),
+            Tool(
+                name="schema_validate",
+                description="Validate a payload against the active schema for an event type. "
+                "Returns validation result with detailed error messages.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "event_type": {"type": "string"},
+                        "payload": {"type": "object", "description": "Payload to validate"},
+                    },
+                    "required": ["event_type", "payload"],
+                },
+            ),
+            Tool(
+                name="schema_delete",
+                description="Delete a schema version by ID.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"schema_id": {"type": "string"}},
+                    "required": ["schema_id"],
+                },
+            ),
+            # ── Fan-Out Delivery Groups ──────────────────────────────
+            Tool(
+                name="group_create",
+                description="Create a named delivery group for fan-out: send one event to N endpoints simultaneously. "
+                    "Strategies: parallel, sequential, weighted. Failure strategies: all_must_succeed, "
+                    "any_success, majority_success, threshold.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Human-readable group name"},
+                        "description": {"type": "string", "description": "Optional description"},
+                        "members": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "endpoint_id": {"type": "string"},
+                                    "weight": {"type": "integer", "minimum": 1, "default": 1},
+                                    "headers": {"type": "object", "description": "Per-member header overrides"},
+                                    "enabled": {"type": "boolean", "default": True},
+                                },
+                                "required": ["endpoint_id"],
+                            },
+                            "description": "Endpoint members with optional weight and headers",
+                        },
+                        "strategy": {"type": "string", "enum": ["parallel", "sequential", "weighted"], "default": "parallel"},
+                        "failure_strategy": {
+                            "type": "string",
+                            "enum": ["all_must_succeed", "any_success", "majority_success", "threshold"],
+                            "default": "all_must_succeed",
+                        },
+                        "success_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0,
+                            "description": "Fraction of members that must succeed (threshold strategy only)"},
+                        "max_concurrent": {"type": "integer", "minimum": 0, "default": 0,
+                            "description": "Max concurrent sends for parallel (0 = unlimited)"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name"],
+                },
+            ),
+            Tool(
+                name="group_get",
+                description="Get a delivery group by ID, including all members and configuration.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"group_id": {"type": "string"}},
+                    "required": ["group_id"],
+                },
+            ),
+            Tool(
+                name="group_list",
+                description="List delivery groups, optionally filtered by status or tag.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["active", "paused", "disabled"]},
+                        "tag": {"type": "string"},
+                    },
+                },
+            ),
+            Tool(
+                name="group_update",
+                description="Update a delivery group's configuration (strategy, failure strategy, status, etc.).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "group_id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "strategy": {"type": "string", "enum": ["parallel", "sequential", "weighted"]},
+                        "failure_strategy": {"type": "string", "enum": ["all_must_succeed", "any_success", "majority_success", "threshold"]},
+                        "success_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "status": {"type": "string", "enum": ["active", "paused", "disabled"]},
+                        "max_concurrent": {"type": "integer", "minimum": 0},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["group_id"],
+                },
+            ),
+            Tool(
+                name="group_delete",
+                description="Delete a delivery group by ID.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"group_id": {"type": "string"}},
+                    "required": ["group_id"],
+                },
+            ),
+            Tool(
+                name="group_add_member",
+                description="Add an endpoint as a member to a delivery group.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "group_id": {"type": "string"},
+                        "endpoint_id": {"type": "string"},
+                        "weight": {"type": "integer", "minimum": 1, "default": 1},
+                        "headers": {"type": "object", "description": "Per-member header overrides"},
+                    },
+                    "required": ["group_id", "endpoint_id"],
+                },
+            ),
+            Tool(
+                name="group_remove_member",
+                description="Remove an endpoint from a delivery group.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "group_id": {"type": "string"},
+                        "endpoint_id": {"type": "string"},
+                    },
+                    "required": ["group_id", "endpoint_id"],
+                },
+            ),
+            Tool(
+                name="group_deliver",
+                description="Deliver a payload to all active members of a delivery group. "
+                    "Uses the group's strategy (parallel/sequential/weighted) and evaluates "
+                    "the aggregate result using the failure strategy. Set dry_run=true to simulate.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "group_id": {"type": "string"},
+                        "payload": {"type": "object", "description": "JSON payload to deliver"},
+                        "event_type": {"type": "string"},
+                        "headers": {"type": "object", "description": "Global headers for all members"},
+                        "dry_run": {"type": "boolean", "default": False, "description": "Simulate without sending"},
+                    },
+                    "required": ["group_id", "payload"],
+                },
+            ),
+            Tool(
+                name="group_deliveries_list",
+                description="List delivery results for a delivery group.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "group_id": {"type": "string"},
+                        "status": {"type": "string", "enum": ["success", "failed", "partial"]},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
+                    },
+                    "required": ["group_id"],
+                },
+            ),
+            Tool(
+                name="group_stats",
+                description="Get aggregate delivery statistics for a group (total, success rate, etc.).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"group_id": {"type": "string"}},
+                    "required": ["group_id"],
                 },
             ),
         ]
@@ -2121,6 +2441,243 @@ def create_server(store_path: str = "webhook_store.json") -> Server:
                         {"endpoint_id": eid, "status": "none", "message": "No verification challenge exists for this endpoint."}
                     ))]
                 return [TextContent(type="text", text=json.dumps(ch.to_dict(), default=str, indent=2))]
+
+            # ── Outbox & Event Replay ────────────────────────────────────
+            elif name == "outbox_list":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                start_dt = _parse_dt(arguments.get("start_time"))
+                end_dt = _parse_dt(arguments.get("end_time"))
+                status_val = arguments.get("status")
+                from .models import OutboxStatus as _OS
+                entries = svc.list_outbox(
+                    event_type=arguments.get("event_type"),
+                    source=arguments.get("source"),
+                    status=_OS(status_val) if status_val else None,
+                    endpoint_id=arguments.get("endpoint_id"),
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    limit=arguments.get("limit", 100),
+                )
+                return [TextContent(type="text", text=json.dumps(
+                    [e.model_dump(mode="json") for e in entries], default=str, indent=2
+                ))]
+
+            elif name == "outbox_get":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                entry = svc.get_outbox_entry(arguments["entry_id"])
+                if entry is None:
+                    return [TextContent(type="text", text=f"Outbox entry not found: {arguments['entry_id']}")]
+                return [TextContent(type="text", text=json.dumps(entry.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "outbox_stats":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                stats = svc.outbox_stats()
+                return [TextContent(type="text", text=json.dumps(stats, default=str, indent=2))]
+
+            elif name == "replay_create":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                batch = svc.create_replay_batch(
+                    start_time=_parse_dt(arguments.get("start_time")),
+                    end_time=_parse_dt(arguments.get("end_time")),
+                    event_type=arguments.get("event_type"),
+                    endpoint_id=arguments.get("endpoint_id"),
+                    source=arguments.get("source"),
+                    target_endpoint_ids=arguments.get("target_endpoint_ids"),
+                )
+                if batch is None:
+                    return [TextContent(type="text", text="Outbox requires SQLite store. Use .db file extension.")]
+                return [TextContent(type="text", text=json.dumps(batch.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "replay_execute":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                batch = await svc.execute_replay_batch(arguments["batch_id"])
+                if batch is None:
+                    return [TextContent(type="text", text=f"Replay batch not found: {arguments['batch_id']}")]
+                return [TextContent(type="text", text=json.dumps(batch.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "replay_status":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                batch = svc.get_replay_batch(arguments["batch_id"])
+                if batch is None:
+                    return [TextContent(type="text", text=f"Replay batch not found: {arguments['batch_id']}")]
+                return [TextContent(type="text", text=json.dumps(batch.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "replay_list":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                batches = svc.list_replay_batches(status=arguments.get("status"))
+                return [TextContent(type="text", text=json.dumps(
+                    [b.model_dump(mode="json") for b in batches], default=str, indent=2
+                ))]
+
+            elif name == "replay_cancel":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                batch = svc.cancel_replay_batch(arguments["batch_id"])
+                if batch is None:
+                    return [TextContent(type="text", text=f"Replay batch not found or already completed: {arguments['batch_id']}")]
+                return [TextContent(type="text", text=json.dumps(batch.model_dump(mode="json"), default=str, indent=2))]
+
+            # ── Schema Validation ───────────────────────────────────────
+            elif name == "schema_create":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                sv = svc.create_schema(
+                    event_type=arguments["event_type"],
+                    version=arguments["version"],
+                    schema=arguments["schema"],
+                    strict=arguments.get("strict", False),
+                    description=arguments.get("description"),
+                )
+                if sv is None:
+                    return [TextContent(type="text", text="Schema storage requires SQLite store. Use .db file extension.")]
+                return [TextContent(type="text", text=json.dumps(sv.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "schema_get":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                sv = svc.get_schema(arguments["event_type"], arguments.get("version"))
+                if sv is None:
+                    return [TextContent(type="text", text=f"No schema found for event type: {arguments['event_type']}")]
+                return [TextContent(type="text", text=json.dumps(sv.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "schema_list":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                svs = svc.list_schemas(arguments.get("event_type"), arguments.get("active_only", False))
+                if not svs:
+                    return [TextContent(type="text", text="[]")]
+                return [TextContent(type="text", text=json.dumps(
+                    [s.model_dump(mode="json") for s in svs], default=str, indent=2
+                ))]
+
+            elif name == "schema_validate":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                result = svc.validate_payload(arguments["event_type"], arguments["payload"])
+                return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
+
+            elif name == "schema_delete":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                deleted = svc.delete_schema(arguments["schema_id"])
+                return [TextContent(type="text", text=f"Schema deleted: {arguments['schema_id']}" if deleted else f"Schema not found: {arguments['schema_id']}")]
+
+            # ── Fan-Out Delivery Groups ──────────────────────────────
+
+            elif name == "group_create":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                group = svc.create_delivery_group(
+                    name=arguments["name"],
+                    members=arguments.get("members", []),
+                    strategy=arguments.get("strategy", "parallel"),
+                    failure_strategy=arguments.get("failure_strategy", "all_must_succeed"),
+                    success_threshold=arguments.get("success_threshold", 1.0),
+                    description=arguments.get("description"),
+                    max_concurrent=arguments.get("max_concurrent", 0),
+                    tags=arguments.get("tags"),
+                )
+                return [TextContent(type="text", text=json.dumps(group.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "group_get":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                group = svc.get_delivery_group(arguments["group_id"])
+                if group is None:
+                    return [TextContent(type="text", text=f"Group not found: {arguments['group_id']}")]
+                return [TextContent(type="text", text=json.dumps(group.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "group_list":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                groups = svc.list_delivery_groups(
+                    status=arguments.get("status"),
+                    tag=arguments.get("tag"),
+                )
+                if not groups:
+                    return [TextContent(type="text", text="[]")]
+                return [TextContent(type="text", text=json.dumps(
+                    [g.model_dump(mode="json") for g in groups], default=str, indent=2
+                ))]
+
+            elif name == "group_update":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                updates = {k: v for k, v in arguments.items() if k != "group_id"}
+                group = svc.update_delivery_group(arguments["group_id"], **updates)
+                if group is None:
+                    return [TextContent(type="text", text=f"Group not found: {arguments['group_id']}")]
+                return [TextContent(type="text", text=json.dumps(group.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "group_delete":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                deleted = svc.delete_delivery_group(arguments["group_id"])
+                return [TextContent(type="text", text=f"Group deleted: {arguments['group_id']}" if deleted else f"Group not found: {arguments['group_id']}")]
+
+            elif name == "group_add_member":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                group = svc.add_group_member(
+                    arguments["group_id"],
+                    arguments["endpoint_id"],
+                    arguments.get("weight", 1),
+                    arguments.get("headers"),
+                )
+                if group is None:
+                    return [TextContent(type="text", text=f"Group not found: {arguments['group_id']}")]
+                return [TextContent(type="text", text=json.dumps(group.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "group_remove_member":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                removed = svc.remove_group_member(arguments["group_id"], arguments["endpoint_id"])
+                return [TextContent(type="text", text=json.dumps({"removed": removed}))]
+
+            elif name == "group_deliver":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                if arguments.get("dry_run", False):
+                    result = await svc.fanout_deliver_dry_run(
+                        arguments["group_id"],
+                        arguments["payload"],
+                        arguments.get("event_type"),
+                    )
+                else:
+                    result = await svc.fanout_deliver(
+                        arguments["group_id"],
+                        arguments["payload"],
+                        arguments.get("event_type"),
+                        arguments.get("headers"),
+                    )
+                return [TextContent(type="text", text=json.dumps(result.model_dump(mode="json"), default=str, indent=2))]
+
+            elif name == "group_deliveries_list":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                deliveries = svc.list_group_deliveries(
+                    group_id=arguments["group_id"],
+                    status=arguments.get("status"),
+                    limit=arguments.get("limit", 100),
+                )
+                if not deliveries:
+                    return [TextContent(type="text", text="[]")]
+                return [TextContent(type="text", text=json.dumps(
+                    [d.model_dump(mode="json") for d in deliveries], default=str, indent=2
+                ))]
+
+            elif name == "group_stats":
+                from .service import WebhookService
+                svc = WebhookService(store=store)
+                stats = svc.group_delivery_stats(arguments["group_id"])
+                return [TextContent(type="text", text=json.dumps(stats, default=str, indent=2))]
 
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]

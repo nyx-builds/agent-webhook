@@ -12,12 +12,20 @@ from typing import Any
 from .models import (
     DeadLetterEntry,
     DeliveryAttempt,
+    DeliveryGroup,
     DeliveryStatus,
     EventLogEntry,
     EventSubscription,
+    GroupDeliveryResult,
+    GroupDeliveryStatus,
+    GroupStatus,
     IncomingWebhook,
+    OutboxEntry,
+    OutboxStatus,
     PayloadTransform,
     RelayRule,
+    ReplayBatch,
+    SchemaVersion,
     WebhookDelivery,
     WebhookEndpoint,
     WebhookSchedule,
@@ -115,6 +123,70 @@ CREATE TABLE IF NOT EXISTS schedules (
 CREATE INDEX IF NOT EXISTS idx_schedules_endpoint ON schedules(endpoint_id);
 CREATE INDEX IF NOT EXISTS idx_schedules_active ON schedules(active);
 CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run_at);
+
+CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'delivery',
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    delivered_at TEXT,
+    data TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_event_type ON outbox(event_type);
+CREATE INDEX IF NOT EXISTS idx_outbox_source ON outbox(source);
+CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
+CREATE INDEX IF NOT EXISTS idx_outbox_created ON outbox(created_at);
+
+CREATE TABLE IF NOT EXISTS replay_batches (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    data TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_batches_status ON replay_batches(status);
+
+CREATE TABLE IF NOT EXISTS schema_versions (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    version TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_schema_event_type ON schema_versions(event_type);
+CREATE INDEX IF NOT EXISTS idx_schema_active ON schema_versions(active);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_schema_event_version ON schema_versions(event_type, version);
+
+CREATE TABLE IF NOT EXISTS delivery_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_groups_status ON delivery_groups(status);
+CREATE INDEX IF NOT EXISTS idx_groups_name ON delivery_groups(name);
+
+CREATE TABLE IF NOT EXISTS group_deliveries (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    event_type TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    data TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gdeliveries_group ON group_deliveries(group_id);
+CREATE INDEX IF NOT EXISTS idx_gdeliveries_status ON group_deliveries(status);
+CREATE INDEX IF NOT EXISTS idx_gdeliveries_event ON group_deliveries(event_type);
 """
 
 
@@ -808,3 +880,408 @@ class SQLiteStore:
         ).fetchall()
         schedules = [WebhookSchedule.model_validate_json(r["data"]) for r in rows]
         return [s for s in schedules if s.is_due()]
+
+    # --- Outbox ---
+
+    def add_outbox_entry(self, entry: OutboxEntry) -> OutboxEntry:
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO outbox (id, event_type, source, status, created_at, delivered_at, data) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entry.id,
+                    entry.event_type,
+                    entry.source,
+                    entry.status.value,
+                    entry.created_at.isoformat(),
+                    entry.delivered_at.isoformat() if entry.delivered_at else None,
+                    entry.model_dump_json(),
+                ),
+            )
+            conn.commit()
+        return entry
+
+    def get_outbox_entry(self, entry_id: str) -> OutboxEntry | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT data FROM outbox WHERE id = ?", (entry_id,)).fetchone()
+        if row is None:
+            return None
+        return OutboxEntry.model_validate_json(row["data"])
+
+    def list_outbox(
+        self,
+        event_type: str | None = None,
+        source: str | None = None,
+        status: OutboxStatus | None = None,
+        endpoint_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 100,
+    ) -> list[OutboxEntry]:
+        conn = self._get_conn()
+        query = "SELECT data FROM outbox WHERE 1=1"
+        params: list[Any] = []
+        if event_type is not None:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        if source is not None:
+            query += " AND source = ?"
+            params.append(source)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status.value)
+        if start_time is not None:
+            query += " AND created_at >= ?"
+            params.append(start_time.isoformat())
+        if end_time is not None:
+            query += " AND created_at <= ?"
+            params.append(end_time.isoformat())
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        entries = [OutboxEntry.model_validate_json(r["data"]) for r in rows]
+        # Filter by endpoint_id (stored inside JSON, not indexed)
+        if endpoint_id is not None:
+            entries = [e for e in entries if endpoint_id in e.endpoint_ids]
+        return entries
+
+    def update_outbox_entry(self, entry_id: str, **updates: Any) -> OutboxEntry | None:
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute("SELECT data FROM outbox WHERE id = ?", (entry_id,)).fetchone()
+            if row is None:
+                return None
+            entry = OutboxEntry.model_validate_json(row["data"])
+            for key, value in updates.items():
+                if hasattr(entry, key):
+                    setattr(entry, key, value)
+            conn.execute(
+                "UPDATE outbox SET data = ?, status = ?, event_type = ?, source = ?, created_at = ?, delivered_at = ? WHERE id = ?",
+                (
+                    entry.model_dump_json(),
+                    entry.status.value,
+                    entry.event_type,
+                    entry.source,
+                    entry.created_at.isoformat(),
+                    entry.delivered_at.isoformat() if entry.delivered_at else None,
+                    entry_id,
+                ),
+            )
+            conn.commit()
+        return entry
+
+    def outbox_count(
+        self,
+        event_type: str | None = None,
+        status: OutboxStatus | None = None,
+    ) -> int:
+        conn = self._get_conn()
+        query = "SELECT COUNT(*) as cnt FROM outbox WHERE 1=1"
+        params: list[Any] = []
+        if event_type is not None:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status.value)
+        row = conn.execute(query, params).fetchone()
+        return row["cnt"] if row else 0
+
+    # --- Replay Batches ---
+
+    def add_replay_batch(self, batch: ReplayBatch) -> ReplayBatch:
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO replay_batches (id, status, created_at, completed_at, data) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    batch.id,
+                    batch.status.value,
+                    batch.created_at.isoformat(),
+                    batch.completed_at.isoformat() if batch.completed_at else None,
+                    batch.model_dump_json(),
+                ),
+            )
+            conn.commit()
+        return batch
+
+    def get_replay_batch(self, batch_id: str) -> ReplayBatch | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT data FROM replay_batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return ReplayBatch.model_validate_json(row["data"])
+
+    def list_replay_batches(
+        self,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[ReplayBatch]:
+        conn = self._get_conn()
+        if status is not None:
+            rows = conn.execute(
+                "SELECT data FROM replay_batches WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT data FROM replay_batches ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [ReplayBatch.model_validate_json(r["data"]) for r in rows]
+
+    def update_replay_batch(self, batch_id: str, **updates: Any) -> ReplayBatch | None:
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT data FROM replay_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            batch = ReplayBatch.model_validate_json(row["data"])
+            for key, value in updates.items():
+                if hasattr(batch, key):
+                    setattr(batch, key, value)
+            conn.execute(
+                "UPDATE replay_batches SET data = ?, status = ?, completed_at = ? WHERE id = ?",
+                (
+                    batch.model_dump_json(),
+                    batch.status.value,
+                    batch.completed_at.isoformat() if batch.completed_at else None,
+                    batch_id,
+                ),
+            )
+            conn.commit()
+        return batch
+
+    # --- Schema Versions ---
+
+    def add_schema_version(self, sv: SchemaVersion) -> SchemaVersion:
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO schema_versions (id, event_type, version, active, created_at, data) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    sv.id,
+                    sv.event_type,
+                    sv.version,
+                    1 if sv.active else 0,
+                    sv.created_at.isoformat(),
+                    sv.model_dump_json(),
+                ),
+            )
+            conn.commit()
+        return sv
+
+    def get_schema_version(
+        self,
+        event_type: str,
+        version: str | None = None,
+    ) -> SchemaVersion | None:
+        """Get a schema version by event type. If version is None, returns the latest active one."""
+        conn = self._get_conn()
+        if version is not None:
+            row = conn.execute(
+                "SELECT data FROM schema_versions WHERE event_type = ? AND version = ?",
+                (event_type, version),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT data FROM schema_versions WHERE event_type = ? AND active = 1 "
+                "ORDER BY created_at DESC LIMIT 1",
+                (event_type,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SchemaVersion.model_validate_json(row["data"])
+
+    def list_schema_versions(
+        self,
+        event_type: str | None = None,
+        active_only: bool = False,
+    ) -> list[SchemaVersion]:
+        conn = self._get_conn()
+        query = "SELECT data FROM schema_versions WHERE 1=1"
+        params: list[Any] = []
+        if event_type is not None:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        return [SchemaVersion.model_validate_json(r["data"]) for r in rows]
+
+    def update_schema_version(self, sv_id: str, **updates: Any) -> SchemaVersion | None:
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT data FROM schema_versions WHERE id = ?", (sv_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            sv = SchemaVersion.model_validate_json(row["data"])
+            for key, value in updates.items():
+                if hasattr(sv, key):
+                    setattr(sv, key, value)
+            conn.execute(
+                "UPDATE schema_versions SET data = ?, active = ? WHERE id = ?",
+                (sv.model_dump_json(), 1 if sv.active else 0, sv_id),
+            )
+            conn.commit()
+        return sv
+
+    def delete_schema_version(self, sv_id: str) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute("DELETE FROM schema_versions WHERE id = ?", (sv_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # --- Delivery Groups ---
+
+    def add_delivery_group(self, group: DeliveryGroup) -> DeliveryGroup:
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO delivery_groups (id, name, status, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?, ?)",
+                (group.id, group.name, group.status.value,
+                 group.created_at.isoformat(), group.updated_at.isoformat(),
+                 group.model_dump_json()),
+            )
+            conn.commit()
+        return group
+
+    def get_delivery_group(self, group_id: str) -> DeliveryGroup | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT data FROM delivery_groups WHERE id = ?", (group_id,)).fetchone()
+        if row is None:
+            return None
+        return DeliveryGroup.model_validate_json(row["data"])
+
+    def list_delivery_groups(
+        self,
+        status: str | GroupStatus | None = None,
+        tag: str | None = None,
+    ) -> list[DeliveryGroup]:
+        conn = self._get_conn()
+        query = "SELECT data FROM delivery_groups WHERE 1=1"
+        params: list[Any] = []
+        if status is not None:
+            status_val = status.value if isinstance(status, GroupStatus) else status
+            query += " AND status = ?"
+            params.append(status_val)
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        groups = [DeliveryGroup.model_validate_json(r["data"]) for r in rows]
+        if tag is not None:
+            groups = [g for g in groups if tag in g.tags]
+        return groups
+
+    def update_delivery_group(self, group_id: str, **updates: Any) -> DeliveryGroup | None:
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute("SELECT data FROM delivery_groups WHERE id = ?", (group_id,)).fetchone()
+            if row is None:
+                return None
+            group = DeliveryGroup.model_validate_json(row["data"])
+            for key, value in updates.items():
+                if hasattr(group, key):
+                    setattr(group, key, value)
+            group.updated_at = datetime.now(timezone.utc)
+            conn.execute(
+                "UPDATE delivery_groups SET data = ?, name = ?, status = ?, updated_at = ? WHERE id = ?",
+                (group.model_dump_json(), group.name, group.status.value,
+                 group.updated_at.isoformat(), group_id),
+            )
+            conn.commit()
+        return group
+
+    def delete_delivery_group(self, group_id: str) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute("DELETE FROM delivery_groups WHERE id = ?", (group_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # --- Group Deliveries ---
+
+    def add_group_delivery(self, result: GroupDeliveryResult) -> GroupDeliveryResult:
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO group_deliveries (id, group_id, status, event_type, created_at, completed_at, data) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (result.id, result.group_id, result.status.value,
+                 result.event_type, result.started_at.isoformat(),
+                 result.completed_at.isoformat() if result.completed_at else None,
+                 result.model_dump_json()),
+            )
+            conn.commit()
+        return result
+
+    def get_group_delivery(self, delivery_id: str) -> GroupDeliveryResult | None:
+        conn = self._get_conn()
+        row = conn.execute("SELECT data FROM group_deliveries WHERE id = ?", (delivery_id,)).fetchone()
+        if row is None:
+            return None
+        return GroupDeliveryResult.model_validate_json(row["data"])
+
+    def list_group_deliveries(
+        self,
+        group_id: str | None = None,
+        status: str | GroupDeliveryStatus | None = None,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> list[GroupDeliveryResult]:
+        conn = self._get_conn()
+        query = "SELECT data FROM group_deliveries WHERE 1=1"
+        params: list[Any] = []
+        if group_id is not None:
+            query += " AND group_id = ?"
+            params.append(group_id)
+        if status is not None:
+            status_val = status.value if isinstance(status, GroupDeliveryStatus) else status
+            query += " AND status = ?"
+            params.append(status_val)
+        if event_type is not None:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [GroupDeliveryResult.model_validate_json(r["data"]) for r in rows]
+
+    def update_group_delivery(self, delivery_id: str, **updates: Any) -> GroupDeliveryResult | None:
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute("SELECT data FROM group_deliveries WHERE id = ?", (delivery_id,)).fetchone()
+            if row is None:
+                return None
+            result = GroupDeliveryResult.model_validate_json(row["data"])
+            for key, value in updates.items():
+                if hasattr(result, key):
+                    setattr(result, key, value)
+            conn.execute(
+                "UPDATE group_deliveries SET data = ?, status = ?, completed_at = ? WHERE id = ?",
+                (result.model_dump_json(), result.status.value,
+                 result.completed_at.isoformat() if result.completed_at else None,
+                 delivery_id),
+            )
+            conn.commit()
+        return result
+
+    def group_delivery_count(self, group_id: str | None = None) -> int:
+        conn = self._get_conn()
+        if group_id is not None:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM group_deliveries WHERE group_id = ?", (group_id,)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) as cnt FROM group_deliveries").fetchone()
+        return row["cnt"] if row else 0

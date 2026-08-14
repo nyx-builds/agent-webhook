@@ -2666,5 +2666,697 @@ def apikey_generate(name: str, scope: tuple[str, ...], expires_in: int | None) -
     console.print(f"[dim]Use it in the 'X-API-Key' header or 'Authorization: Bearer *** header.[/dim]")
 
 
+# ── Outbox ──────────────────────────────────────────────────────────────
+
+@cli.group("outbox")
+def outbox_group() -> None:
+    """Outbox event inspection — durable record of all outbound events."""
+    pass
+
+
+@outbox_group.command("list")
+@click.option("--store", "store_path", default=None, help="Store path")
+@click.option("--event-type", default=None, help="Filter by event type")
+@click.option("--source", default=None, help="Filter by source")
+@click.option("--status", default=None, help="Filter by status")
+@click.option("--endpoint-id", default=None, help="Filter by endpoint")
+@click.option("--limit", default=20, help="Max results")
+def outbox_list(
+    store_path: str | None,
+    event_type: str | None,
+    source: str | None,
+    status: str | None,
+    endpoint_id: str | None,
+    limit: int,
+) -> None:
+    """List outbox entries with optional filters."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    from .models import OutboxStatus
+
+    status_enum = None
+    if status:
+        try:
+            status_enum = OutboxStatus(status)
+        except ValueError:
+            console.print(f"[red]Invalid status: {status}[/red]")
+            sys.exit(1)
+
+    entries = service.list_outbox(
+        event_type=event_type,
+        source=source,
+        status=status_enum,
+        endpoint_id=endpoint_id,
+        limit=limit,
+    )
+
+    if not entries:
+        console.print("[yellow]No outbox entries found.[/yellow]")
+        return
+
+    table = Table(title="Outbox Entries")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Event Type", style="magenta")
+    table.add_column("Status", style="green")
+    table.add_column("Source")
+    table.add_column("Endpoints")
+    table.add_column("Created", style="dim")
+
+    for e in entries:
+        table.add_row(
+            str(e.id)[:12],
+            e.event_type,
+            e.status,
+            e.source or "—",
+            str(len(e.endpoint_ids)),
+            format_dt(e.created_at),
+        )
+
+    console.print(table)
+
+
+@outbox_group.command("show")
+@click.argument("entry_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+def outbox_show(entry_id: str, store_path: str | None) -> None:
+    """Show full details of an outbox entry."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    entry = service.get_outbox_entry(entry_id)
+
+    if not entry:
+        console.print(f"[red]Entry {entry_id} not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Outbox Entry[/bold] [cyan]{entry.id}[/cyan]\n")
+    console.print(f"  Event Type:    {entry.event_type}")
+    console.print(f"  Status:        {entry.status}")
+    console.print(f"  Source:        {entry.source or '—'}")
+    console.print(f"  Endpoints:     {', '.join(entry.endpoint_ids)}")
+    console.print(f"  Created:       {format_dt(entry.created_at)}")
+    if entry.delivered_at:
+        console.print(f"  Delivered:     {format_dt(entry.delivered_at)}")
+    if entry.failure_count:
+        console.print(f"  Failures:      [red]{entry.failure_count}[/red]")
+    console.print(f"\n[bold]Payload:[/bold]")
+    console.print_json(data=entry.payload)
+
+
+@outbox_group.command("stats")
+@click.option("--store", "store_path", default=None, help="Store path")
+def outbox_stats(store_path: str | None) -> None:
+    """Show aggregate outbox statistics."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    stats = service.outbox_stats()
+
+    console.print("\n[bold]Outbox Statistics[/bold]\n")
+    for key, value in stats.items():
+        console.print(f"  {key.replace('_', ' ').title():.<25} {value}")
+
+
+# ── Replay ─────────────────────────────────────────────────────────────
+
+@cli.group("replay")
+def replay_group() -> None:
+    """Event replay — re-deliver outbox events."""
+    pass
+
+
+@replay_group.command("create")
+@click.option("--store", "store_path", default=None, help="Store path")
+@click.option("--start-time", default=None, help="ISO 8601 — replay from this time")
+@click.option("--end-time", default=None, help="ISO 8601 — replay until this time")
+@click.option("--event-type", default=None, help="Only replay this event type")
+@click.option("--endpoint-id", default=None, help="Only replay events for this endpoint")
+@click.option("--source", default=None, help="Only replay events from this source")
+@click.option(
+    "--target-endpoint",
+    "target_endpoints",
+    multiple=True,
+    help="Override target endpoints (omit for original)",
+)
+def replay_create(
+    store_path: str | None,
+    start_time: str | None,
+    end_time: str | None,
+    event_type: str | None,
+    endpoint_id: str | None,
+    source: str | None,
+    target_endpoints: tuple[str, ...],
+) -> None:
+    """Create a replay batch (preview without delivering)."""
+    from datetime import datetime as _dt
+    from .service import WebhookService
+
+    start_dt = _dt.fromisoformat(start_time) if start_time else None
+    end_dt = _dt.fromisoformat(end_time) if end_time else None
+
+    service = WebhookService(get_store(store_path))
+    batch = service.create_replay_batch(
+        start_time=start_dt,
+        end_time=end_dt,
+        event_type=event_type,
+        endpoint_id=endpoint_id,
+        source=source,
+        target_endpoint_ids=list(target_endpoints) if target_endpoints else None,
+    )
+
+    if not batch:
+        console.print("[red]No matching outbox entries found for replay.[/red]")
+        return
+
+    console.print(f"\n[green]✓ Replay batch created[/green] [cyan]{batch.id}[/cyan]\n")
+    console.print(f"  Status:        {batch.status}")
+    console.print(f"  Total Events:  {batch.total_entries}")
+    console.print(f"  Processed:     {batch.processed}")
+    console.print(f"  Succeeded:     {batch.succeeded}")
+    console.print(f"  Failed:        {batch.failed}")
+    console.print(f"\n[dim]Run 'agent-webhook replay execute {batch.id}' to deliver.[/dim]")
+
+
+@replay_group.command("execute")
+@click.argument("batch_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+def replay_execute(batch_id: str, store_path: str | None) -> None:
+    """Execute a replay batch — actually re-deliver all selected events."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+
+    async def _run():
+        result = await service.execute_replay_batch(batch_id)
+        await service.close()
+        return result
+
+    batch = asyncio.run(_run())
+
+    if not batch:
+        console.print(f"[red]Batch {batch_id} not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[green]✓ Replay batch executed[/green] [cyan]{batch.id}[/cyan]\n")
+    console.print(f"  Status:        {batch.status}")
+    console.print(f"  Total Events:  {batch.total_entries}")
+    console.print(f"  Processed:     {batch.processed}")
+    console.print(f"  Succeeded:     {batch.succeeded}")
+    console.print(f"  Failed:        {batch.failed}")
+
+
+@replay_group.command("status")
+@click.argument("batch_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+def replay_status(batch_id: str, store_path: str | None) -> None:
+    """Check the status of a replay batch."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    batch = service.get_replay_batch(batch_id)
+
+    if not batch:
+        console.print(f"[red]Batch {batch_id} not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Replay Batch[/bold] [cyan]{batch.id}[/cyan]\n")
+    console.print(f"  Status:        {batch.status}")
+    console.print(f"  Total Events:  {batch.total_entries}")
+    console.print(f"  Processed:     {batch.processed}")
+    console.print(f"  Succeeded:     {batch.succeeded}")
+    console.print(f"  Failed:        {batch.failed}")
+    console.print(f"  Created:       {format_dt(batch.created_at)}")
+
+
+@replay_group.command("list")
+@click.option("--store", "store_path", default=None, help="Store path")
+@click.option("--status", default=None, help="Filter by status")
+def replay_list(store_path: str | None, status: str | None) -> None:
+    """List replay batches."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    batches = service.list_replay_batches(status=status)
+
+    if not batches:
+        console.print("[yellow]No replay batches found.[/yellow]")
+        return
+
+    table = Table(title="Replay Batches")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Status", style="green")
+    table.add_column("Total", justify="right")
+    table.add_column("Done", justify="right")
+    table.add_column("OK", justify="right")
+    table.add_column("Fail", justify="right")
+    table.add_column("Created", style="dim")
+
+    for b in batches:
+        table.add_row(
+            str(b.id)[:12],
+            b.status,
+            str(b.total_entries),
+            str(b.processed),
+            str(b.succeeded),
+            str(b.failed),
+            format_dt(b.created_at),
+        )
+
+    console.print(table)
+
+
+@replay_group.command("cancel")
+@click.argument("batch_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+def replay_cancel(batch_id: str, store_path: str | None) -> None:
+    """Cancel a pending or in-progress replay batch."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    batch = service.cancel_replay_batch(batch_id)
+
+    if not batch:
+        console.print(f"[red]Batch {batch_id} not found or not cancellable.[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓ Replay batch {batch_id} cancelled.[/green]")
+
+
+# ── Schema Validation ──────────────────────────────────────────────────
+
+@cli.group("schema")
+def schema_group() -> None:
+    """Schema management — validate event payloads against JSON Schema."""
+    pass
+
+
+@schema_group.command("create")
+@click.argument("event_type")
+@click.argument("version")
+@click.argument("schema_file", type=click.Path(exists=True))
+@click.option("--store", "store_path", default=None, help="Store path")
+@click.option("--description", default=None, help="Schema description")
+def schema_create(
+    event_type: str,
+    version: str,
+    schema_file: str,
+    store_path: str | None,
+    description: str | None,
+) -> None:
+    """Register a JSON Schema for an event type + version."""
+    from .service import WebhookService
+
+    with open(schema_file) as f:
+        schema = json.load(f)
+
+    service = WebhookService(get_store(store_path))
+    sv = service.create_schema(
+        event_type=event_type,
+        version=version,
+        schema=schema,
+        description=description,
+    )
+
+    console.print(f"[green]✓ Schema registered[/green] [cyan]{sv.id}[/cyan]")
+    console.print(f"  Event Type:  {sv.event_type}")
+    console.print(f"  Version:     {sv.version}")
+
+
+@schema_group.command("list")
+@click.option("--store", "store_path", default=None, help="Store path")
+@click.option("--event-type", default=None, help="Filter by event type")
+@click.option("--active-only", is_flag=True, help="Only active schemas")
+def schema_list(
+    store_path: str | None,
+    event_type: str | None,
+    active_only: bool,
+) -> None:
+    """List registered schema versions."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    schemas = service.list_schemas(event_type=event_type, active_only=active_only)
+
+    if not schemas:
+        console.print("[yellow]No schemas found.[/yellow]")
+        return
+
+    table = Table(title="Event Schemas")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Event Type", style="magenta")
+    table.add_column("Version")
+    table.add_column("Active", justify="center")
+    table.add_column("Created", style="dim")
+
+    for s in schemas:
+        active = "[green]✓[/green]" if s.active else "[dim]—[/dim]"
+        table.add_row(
+            str(s.id)[:12],
+            s.event_type,
+            s.version,
+            active,
+            format_dt(s.created_at),
+        )
+
+    console.print(table)
+
+
+@schema_group.command("validate")
+@click.argument("event_type")
+@click.argument("payload_file", type=click.Path(exists=True))
+@click.option("--store", "store_path", default=None, help="Store path")
+@click.option("--version", default=None, help="Specific version (default: latest active)")
+def schema_validate(
+    event_type: str,
+    payload_file: str,
+    store_path: str | None,
+    version: str | None,
+) -> None:
+    """Validate a payload file against a registered schema."""
+    from .service import WebhookService
+
+    with open(payload_file) as f:
+        payload = json.load(f)
+
+    service = WebhookService(get_store(store_path))
+    result = service.validate_payload(event_type, payload)
+
+    if result.get("valid"):
+        console.print(f"[green]✓ Valid against schema '{result.get('schema_version', '?')}'[/green]")
+    else:
+        console.print(f"[red]✗ Invalid[/red]")
+        for err in result.get("errors", []):
+            console.print(f"  [red]•[/red] {err}")
+
+
+# ── Delivery Groups ────────────────────────────────────────────────────
+
+@cli.group("group")
+def group_group() -> None:
+    """Delivery groups — fan-out to multiple endpoints with strategies."""
+    pass
+
+
+@group_group.command("create")
+@click.argument("name")
+@click.option("--store", "store_path", default=None, help="Store path")
+@click.option(
+    "--strategy",
+    type=click.Choice(["parallel", "sequential", "weighted"], case_sensitive=False),
+    default="parallel",
+    help="Delivery strategy",
+)
+@click.option(
+    "--failure-strategy",
+    type=click.Choice(
+        ["all_must_succeed", "any_success", "majority", "ignore"],
+        case_sensitive=False,
+    ),
+    default="all_must_succeed",
+    help="Failure strategy",
+)
+@click.option("--description", "-d", default=None, help="Group description")
+def group_create(
+    name: str,
+    store_path: str | None,
+    strategy: str,
+    failure_strategy: str,
+    description: str | None,
+) -> None:
+    """Create a delivery group for fan-out webhooks."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    group = service.create_delivery_group(
+        name=name,
+        members=[],
+        strategy=strategy.lower(),
+        failure_strategy=failure_strategy.lower(),
+        description=description,
+    )
+
+    console.print(f"[green]✓ Delivery group created[/green] [cyan]{group.id}[/cyan]")
+    console.print(f"  Name:              {group.name}")
+    console.print(f"  Strategy:          {group.strategy}")
+    console.print(f"  Failure Strategy:  {group.failure_strategy}")
+    console.print(f"\n[dim]Add members with: agent-webhook group add-member {group.id} <endpoint-id>[/dim]")
+
+
+@group_group.command("list")
+@click.option("--store", "store_path", default=None, help="Store path")
+def group_list(store_path: str | None) -> None:
+    """List delivery groups."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    groups = service.list_delivery_groups()
+
+    if not groups:
+        console.print("[yellow]No delivery groups found.[/yellow]")
+        return
+
+    table = Table(title="Delivery Groups")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="bold")
+    table.add_column("Strategy", style="magenta")
+    table.add_column("Failure Strategy")
+    table.add_column("Members", justify="right")
+    table.add_column("Status", style="green")
+
+    for g in groups:
+        table.add_row(
+            str(g.id)[:12],
+            g.name,
+            g.strategy,
+            g.failure_strategy,
+            str(len(g.members)),
+            g.status,
+        )
+
+    console.print(table)
+
+
+@group_group.command("show")
+@click.argument("group_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+def group_show(group_id: str, store_path: str | None) -> None:
+    """Show delivery group details including members."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    group = service.get_delivery_group(group_id)
+
+    if not group:
+        console.print(f"[red]Group {group_id} not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Delivery Group[/bold] [cyan]{group.id}[/cyan]\n")
+    console.print(f"  Name:              {group.name}")
+    console.print(f"  Strategy:          {group.strategy}")
+    console.print(f"  Failure Strategy:  {group.failure_strategy}")
+    console.print(f"  Status:            {group.status}")
+    if group.description:
+        console.print(f"  Description:       {group.description}")
+
+    if group.members:
+        table = Table(title="\nMembers")
+        table.add_column("Endpoint ID", style="cyan")
+        table.add_column("Weight", justify="right")
+        for m in group.members:
+            table.add_row(m.endpoint_id, str(m.weight))
+        console.print(table)
+    else:
+        console.print("\n[dim]No members yet.[/dim]")
+
+
+@group_group.command("add-member")
+@click.argument("group_id")
+@click.argument("endpoint_id")
+@click.option("--weight", default=1, type=int, help="Weight (for weighted strategy)")
+@click.option("--store", "store_path", default=None, help="Store path")
+def group_add_member(
+    group_id: str,
+    endpoint_id: str,
+    weight: int,
+    store_path: str | None,
+) -> None:
+    """Add an endpoint to a delivery group."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    group = service.add_group_member(group_id, endpoint_id, weight=weight)
+
+    if not group:
+        console.print(f"[red]Group {group_id} not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓ Member added[/green] — {group.name} now has {len(group.members)} endpoint(s)")
+
+
+@group_group.command("remove-member")
+@click.argument("group_id")
+@click.argument("endpoint_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+def group_remove_member(
+    group_id: str,
+    endpoint_id: str,
+    store_path: str | None,
+) -> None:
+    """Remove an endpoint from a delivery group."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    removed = service.remove_group_member(group_id, endpoint_id)
+
+    if not removed:
+        console.print(f"[red]Group {group_id} or member {endpoint_id} not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓ Member {endpoint_id} removed from group {group_id}.[/green]")
+
+
+@group_group.command("deliver")
+@click.argument("group_id")
+@click.argument("payload", type=str)
+@click.option("--header", "-H", multiple=True, help="Header in 'Name: Value' format")
+@click.option("--dry-run", is_flag=True, help="Preview without sending")
+@click.option("--store", "store_path", default=None, help="Store path")
+def group_deliver(
+    group_id: str,
+    payload: str,
+    header: tuple[str, ...],
+    dry_run: bool,
+    store_path: str | None,
+) -> None:
+    """Deliver a payload to all members of a delivery group."""
+    from .service import WebhookService
+
+    try:
+        payload_data = json.loads(payload)
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Invalid JSON payload: {e}[/red]")
+        sys.exit(1)
+
+    headers: dict[str, str] = {}
+    for h in header:
+        if ":" in h:
+            k, v = h.split(":", 1)
+            headers[k.strip()] = v.strip()
+
+    service = WebhookService(get_store(store_path))
+
+    if dry_run:
+        result = asyncio.run(service.fanout_deliver_dry_run(group_id, payload_data))
+    else:
+        async def _run():
+            r = await service.fanout_deliver(group_id, payload_data)
+            await service.close()
+            return r
+
+        result = asyncio.run(_run())
+
+    if not result:
+        console.print(f"[red]Group {group_id} not found or has no members.[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Delivery Result[/bold] [cyan]{result.id}[/cyan]\n")
+    console.print(f"  Status:    {result.status}")
+    console.print(f"  Strategy:  {result.strategy}")
+    console.print(f"  Total:     {result.total_members}")
+    console.print(f"  Succeeded: [green]{result.success_count}[/green]")
+    console.print(f"  Failed:    [red]{result.failure_count}[/red]")
+
+    if result.member_results:
+        table = Table(title="\nMember Results")
+        table.add_column("Endpoint ID", style="cyan")
+        table.add_column("Status", style="green")
+        table.add_column("HTTP", justify="right")
+        table.add_column("Duration", justify="right")
+        for mr in result.member_results:
+            status_color = "green" if mr.status.value == "delivered" else "red"
+            table.add_row(
+                mr.endpoint_id,
+                f"[{status_color}]{mr.status.value}[/{status_color}]",
+                str(mr.status_code or "—"),
+                f"{mr.duration_ms:.0f}ms" if mr.duration_ms else "—",
+            )
+        console.print(table)
+
+
+@group_group.command("deliveries")
+@click.argument("group_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+@click.option("--limit", default=20, help="Max results")
+def group_deliveries(
+    group_id: str,
+    store_path: str | None,
+    limit: int,
+) -> None:
+    """List delivery results for a group."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    deliveries = service.list_group_deliveries(group_id, limit=limit)
+
+    if not deliveries:
+        console.print("[yellow]No deliveries found.[/yellow]")
+        return
+
+    table = Table(title="Group Deliveries")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Status", style="green")
+    table.add_column("Total", justify="right")
+    table.add_column("OK", justify="right")
+    table.add_column("Fail", justify="right")
+    table.add_column("Delivered At", style="dim")
+
+    for d in deliveries:
+        table.add_row(
+            str(d.id)[:12],
+            d.status,
+            str(d.total_members),
+            str(d.success_count),
+            str(d.failure_count),
+            format_dt(d.completed_at),
+        )
+
+    console.print(table)
+
+
+@group_group.command("stats")
+@click.argument("group_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+def group_stats(group_id: str, store_path: str | None) -> None:
+    """Show delivery statistics for a group."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    stats = service.group_delivery_stats(group_id)
+
+    if not stats:
+        console.print(f"[red]Group {group_id} not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Group Delivery Stats[/bold]\n")
+    for key, value in stats.items():
+        console.print(f"  {key.replace('_', ' ').title():.<25} {value}")
+
+
+@group_group.command("delete")
+@click.argument("group_id")
+@click.option("--store", "store_path", default=None, help="Store path")
+def group_delete(group_id: str, store_path: str | None) -> None:
+    """Delete a delivery group."""
+    from .service import WebhookService
+
+    service = WebhookService(get_store(store_path))
+    if service.delete_delivery_group(group_id):
+        console.print(f"[green]✓ Group {group_id} deleted.[/green]")
+    else:
+        console.print(f"[red]Group {group_id} not found.[/red]")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     cli()

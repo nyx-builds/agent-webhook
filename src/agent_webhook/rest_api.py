@@ -45,6 +45,41 @@ class CreateEndpointRequest(PydanticModel):
     rate_limit: dict[str, Any] | None = None
 
 
+class CreateGroupRequest(PydanticModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str | None = None
+    members: list[dict[str, Any]] = Field(default_factory=list)
+    strategy: str = Field(default="parallel")
+    failure_strategy: str = Field(default="all_must_succeed")
+    success_threshold: float = Field(default=1.0, ge=0.0, le=1.0)
+    max_concurrent: int = Field(default=0, ge=0)
+    tags: list[str] | None = None
+
+
+class UpdateGroupRequest(PydanticModel):
+    name: str | None = None
+    description: str | None = None
+    strategy: str | None = None
+    failure_strategy: str | None = None
+    success_threshold: float | None = None
+    status: str | None = None
+    max_concurrent: int | None = None
+    tags: list[str] | None = None
+
+
+class AddMemberRequest(PydanticModel):
+    endpoint_id: str
+    weight: int = Field(default=1, ge=1)
+    headers: dict[str, str] | None = None
+
+
+class GroupDeliverRequest(PydanticModel):
+    payload: dict[str, Any] = Field(default_factory=dict)
+    event_type: str | None = None
+    headers: dict[str, str] | None = None
+    dry_run: bool = False
+
+
 class UpdateEndpointRequest(PydanticModel):
     name: str | None = None
     url: str | None = None
@@ -137,6 +172,21 @@ class GenerateSignatureRequest(PydanticModel):
     algorithm: str = Field(default="sha256")
 
 
+class CreateSchemaRequest(PydanticModel):
+    event_type: str
+    version: str
+    schema_def: dict[str, Any] = Field(alias="schema")
+    strict: bool = False
+    description: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ValidatePayloadRequest(PydanticModel):
+    event_type: str
+    payload: dict[str, Any]
+
+
 # ── App Factory ────────────────────────────────────────────────────
 
 
@@ -163,7 +213,7 @@ def create_app(
     app = FastAPI(
         title="Agent Webhook",
         description="Webhook management, delivery, and relay REST API for autonomous agents",
-        version="0.7.0",
+        version="1.0.0",
         lifespan=lifespan,
     )
 
@@ -179,7 +229,7 @@ def create_app(
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "version": "0.7.0", "timestamp": datetime.now(timezone.utc).isoformat()}
+        return {"status": "ok", "version": "1.0.0", "timestamp": datetime.now(timezone.utc).isoformat()}
 
     # ── Endpoints ────────────────────────────────────────────────
 
@@ -847,5 +897,247 @@ def create_app(
             "expires_at": key_info.expires_at,
             "note": "Store this key securely. It will not be shown again.",
         }
+
+    # ── Outbox ────────────────────────────────────────────────────
+
+    @app.get("/outbox")
+    async def list_outbox(
+        event_type: str | None = None,
+        source: str | None = None,
+        status: str | None = None,
+        endpoint_id: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        limit: int = Query(100, ge=1, le=1000),
+    ):
+        """List outbox entries with optional filters."""
+        from .models import OutboxStatus
+        start_dt = None
+        end_dt = None
+        if start_time:
+            start_dt = datetime.fromisoformat(start_time)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+        if end_time:
+            end_dt = datetime.fromisoformat(end_time)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+        entries = service.list_outbox(
+            event_type=event_type,
+            source=source,
+            status=OutboxStatus(status) if status else None,
+            endpoint_id=endpoint_id,
+            start_time=start_dt,
+            end_time=end_dt,
+            limit=limit,
+        )
+        return {"entries": [e.model_dump(mode="json") for e in entries], "count": len(entries)}
+
+    @app.get("/outbox/stats")
+    async def outbox_stats():
+        """Get aggregate outbox statistics."""
+        return service.outbox_stats()
+
+    @app.get("/outbox/{entry_id}")
+    async def get_outbox_entry(entry_id: str):
+        """Get a single outbox entry by ID."""
+        entry = service.get_outbox_entry(entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"Outbox entry not found: {entry_id}")
+        return entry.model_dump(mode="json")
+
+    @app.post("/replay/create")
+    async def create_replay_batch(
+        start_time: str | None = None,
+        end_time: str | None = None,
+        event_type: str | None = None,
+        endpoint_id: str | None = None,
+        source: str | None = None,
+        target_endpoint_ids: list[str] | None = None,
+    ):
+        """Create a replay batch for re-delivering outbox events."""
+        start_dt = None
+        end_dt = None
+        if start_time:
+            start_dt = datetime.fromisoformat(start_time)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+        if end_time:
+            end_dt = datetime.fromisoformat(end_time)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+        batch = service.create_replay_batch(
+            start_time=start_dt,
+            end_time=end_dt,
+            event_type=event_type,
+            endpoint_id=endpoint_id,
+            source=source,
+            target_endpoint_ids=target_endpoint_ids,
+        )
+        if batch is None:
+            raise HTTPException(status_code=400, detail="Outbox requires SQLite store")
+        return batch.model_dump(mode="json")
+
+    @app.post("/replay/{batch_id}/execute")
+    async def execute_replay_batch(batch_id: str):
+        """Execute a replay batch."""
+        batch = await service.execute_replay_batch(batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail=f"Replay batch not found: {batch_id}")
+        return batch.model_dump(mode="json")
+
+    @app.get("/replay/{batch_id}")
+    async def get_replay_batch(batch_id: str):
+        """Get replay batch status."""
+        batch = service.get_replay_batch(batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail=f"Replay batch not found: {batch_id}")
+        return batch.model_dump(mode="json")
+
+    @app.get("/replay")
+    async def list_replay_batches(status_filter: str | None = None):
+        """List replay batches."""
+        batches = service.list_replay_batches(status=status_filter)
+        return {"batches": [b.model_dump(mode="json") for b in batches], "count": len(batches)}
+
+    @app.post("/replay/{batch_id}/cancel")
+    async def cancel_replay_batch(batch_id: str):
+        """Cancel a replay batch."""
+        batch = service.cancel_replay_batch(batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail=f"Replay batch not found or already completed: {batch_id}")
+        return batch.model_dump(mode="json")
+
+    # ── Schema Validation ──────────────────────────────────────────
+
+    @app.post("/schemas")
+    async def create_schema(request: CreateSchemaRequest):
+        """Register a JSON Schema for an event type."""
+        sv = service.create_schema(
+            event_type=request.event_type,
+            version=request.version,
+            schema=request.schema_def,
+            strict=request.strict,
+            description=request.description,
+        )
+        if sv is None:
+            raise HTTPException(status_code=400, detail="Schema storage requires SQLite store")
+        return sv.model_dump(mode="json")
+
+    @app.get("/schemas/{event_type}")
+    async def get_schema(event_type: str, version: str | None = None):
+        """Get the active schema for an event type."""
+        sv = service.get_schema(event_type, version)
+        if sv is None:
+            raise HTTPException(status_code=404, detail=f"No schema found for event type: {event_type}")
+        return sv.model_dump(mode="json")
+
+    @app.get("/schemas")
+    async def list_schemas(event_type: str | None = None, active_only: bool = False):
+        """List registered schemas."""
+        svs = service.list_schemas(event_type, active_only)
+        return {"schemas": [s.model_dump(mode="json") for s in svs], "count": len(svs)}
+
+    @app.post("/schemas/validate")
+    async def validate_payload(request: ValidatePayloadRequest):
+        """Validate a payload against the active schema for an event type."""
+        result = service.validate_payload(request.event_type, request.payload)
+        return result
+
+    @app.delete("/schemas/{schema_id}")
+    async def delete_schema(schema_id: str):
+        """Delete a schema version."""
+        deleted = service.delete_schema(schema_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Schema not found: {schema_id}")
+        return {"deleted": True, "schema_id": schema_id}
+
+    # ── Delivery Groups (Fan-Out) ──────────────────────────────────
+
+    @app.post("/groups")
+    async def create_group(req: CreateGroupRequest):
+        """Create a delivery group."""
+        group = service.create_delivery_group(
+            name=req.name,
+            members=req.members,
+            strategy=req.strategy,
+            failure_strategy=req.failure_strategy,
+            success_threshold=req.success_threshold,
+            description=req.description,
+            max_concurrent=req.max_concurrent,
+            tags=req.tags,
+        )
+        return group.model_dump(mode="json")
+
+    @app.get("/groups")
+    async def list_groups(status: str | None = None, tag: str | None = None):
+        """List delivery groups."""
+        groups = service.list_delivery_groups(status=status, tag=tag)
+        return {"groups": [g.model_dump(mode="json") for g in groups], "count": len(groups)}
+
+    @app.get("/groups/{group_id}")
+    async def get_group(group_id: str):
+        """Get a delivery group by ID."""
+        group = service.get_delivery_group(group_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail=f"Group not found: {group_id}")
+        return group.model_dump(mode="json")
+
+    @app.patch("/groups/{group_id}")
+    async def update_group(group_id: str, req: UpdateGroupRequest):
+        """Update a delivery group."""
+        updates = {k: v for k, v in req.model_dump().items() if v is not None}
+        group = service.update_delivery_group(group_id, **updates)
+        if group is None:
+            raise HTTPException(status_code=404, detail=f"Group not found: {group_id}")
+        return group.model_dump(mode="json")
+
+    @app.delete("/groups/{group_id}")
+    async def delete_group(group_id: str):
+        """Delete a delivery group."""
+        deleted = service.delete_delivery_group(group_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Group not found: {group_id}")
+        return {"deleted": True, "group_id": group_id}
+
+    @app.post("/groups/{group_id}/members")
+    async def add_group_member(group_id: str, req: AddMemberRequest):
+        """Add a member to a delivery group."""
+        group = service.add_group_member(group_id, req.endpoint_id, req.weight, req.headers)
+        if group is None:
+            raise HTTPException(status_code=404, detail=f"Group not found: {group_id}")
+        return group.model_dump(mode="json")
+
+    @app.delete("/groups/{group_id}/members/{endpoint_id}")
+    async def remove_group_member(group_id: str, endpoint_id: str):
+        """Remove a member from a delivery group."""
+        removed = service.remove_group_member(group_id, endpoint_id)
+        return {"removed": removed, "group_id": group_id, "endpoint_id": endpoint_id}
+
+    @app.post("/groups/{group_id}/deliver")
+    async def group_deliver(group_id: str, req: GroupDeliverRequest):
+        """Deliver a payload to all members of a delivery group."""
+        if req.dry_run:
+            result = await service.fanout_deliver_dry_run(
+                group_id, payload=req.payload, event_type=req.event_type,
+            )
+        else:
+            result = await service.fanout_deliver(
+                group_id, payload=req.payload, event_type=req.event_type, headers=req.headers,
+            )
+        return result.model_dump(mode="json")
+
+    @app.get("/groups/{group_id}/deliveries")
+    async def list_group_deliveries(group_id: str, limit: int = 100):
+        """List deliveries for a specific group."""
+        deliveries = service.list_group_deliveries(group_id=group_id, limit=limit)
+        return {"deliveries": [d.model_dump(mode="json") for d in deliveries], "count": len(deliveries)}
+
+    @app.get("/groups/{group_id}/stats")
+    async def group_stats(group_id: str):
+        """Get aggregate delivery stats for a group."""
+        return service.group_delivery_stats(group_id)
 
     return app
